@@ -11,6 +11,7 @@ pub mod font;
 pub mod gfx;
 pub mod hud;
 pub mod loader;
+pub mod menu;
 pub mod mesh;
 pub mod model;
 pub mod overlay;

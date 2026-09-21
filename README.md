@@ -30,7 +30,9 @@ voxview --write-fixtures dir # write the synthetic test fixtures and exit
 ```
 
 Naming a single file still lists its siblings, so `[` and `]` page through the
-rest of the directory from wherever you started.
+rest of the directory from wherever you started, and `M` opens a menu over them.
+Directories of a few hundred files -- Veloren ships several -- are best browsed
+from the menu, where you can type part of a name to narrow the list.
 
 The open file is watched. Save from MagicaVoxel and the model re-parses and
 re-meshes in place, without moving the camera. If the new bytes do not parse,
@@ -53,8 +55,33 @@ stderr.
 | `T` | Toggle the dark and light background |
 | `P` | Save a PNG next to the model |
 | `[`, `]` | Previous, next `.vox` in the directory |
+| `M`, `Tab` | Open and close the file menu |
 | `R` | Reload now |
 | `Esc`, `Q` | Quit |
+
+### In the file menu
+
+| Key | Action |
+| --- | --- |
+| Up, Down | Move the cursor, loading each file as you pass it |
+| PgUp, PgDn | Jump a screenful |
+| Click a row | Load that file |
+| Scroll | Scroll the list, without loading anything |
+| any letter | Add it to the filter |
+| Backspace | Remove the last filter character |
+| Enter | Load the highlighted file and close |
+| `Esc` | Clear the filter, or close if there is none |
+| `Tab` | Close, leaving the current file on screen |
+
+The menu lists the directory, marks the file on screen with `>` and the cursor
+with a highlight bar, and shows how many entries are above and below the view.
+Arrowing through it previews each file; typing only moves the cursor, so you
+can narrow a long list down before committing to a load.
+
+While the menu is open the single-letter shortcuts above belong to the filter,
+so `G` types a `g` rather than toggling the grid, and `M` will not close the
+menu it opened -- `Esc` or `Tab` do that. `Home`, `F` and the mouse still work
+on the camera, and `Esc` closes the menu rather than quitting the viewer.
 
 `P` writes `<name>_<YYYYMMDD-HHMMSS>.png` beside the model, at window
 resolution, with a transparent background and without the HUD or the overlays —

@@ -4,6 +4,7 @@ use crate::camera::OrbitCamera;
 use crate::gfx::{Background, FrameParams, Renderer};
 use crate::hud::HudLine;
 use crate::loader::{self, VoxScene};
+use crate::menu::{Hit, Menu};
 use crate::mesh;
 use crate::watch::FileWatcher;
 use anyhow::{Context, Result};
@@ -110,6 +111,12 @@ struct Mouse {
 struct App {
     paths: Vec<PathBuf>,
     index: usize,
+    /// File names for the menu, built once: the listing does not change while
+    /// the viewer is open.
+    names: Vec<String>,
+    /// The directory the listing came from, shown as the menu's heading.
+    title: String,
+    menu: Menu,
 
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -136,12 +143,24 @@ struct App {
 
 /// How long a one-off message (a screenshot path, say) stays in the HUD.
 const STATUS_SECONDS: f32 = 4.0;
+/// File rows one notch of the wheel scrolls the menu by.
+const WHEEL_ROWS: usize = 3;
 
 impl App {
     fn new(paths: Vec<PathBuf>, index: usize) -> App {
+        let names = paths.iter().map(|p| file_name(p)).collect();
+        let title = paths
+            .first()
+            .and_then(|p| p.parent())
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(file_name)
+            .unwrap_or_else(|| ".".into());
         App {
             paths,
             index,
+            names,
+            title,
+            menu: Menu::new(),
             window: None,
             renderer: None,
             watcher: None,
@@ -207,6 +226,20 @@ impl App {
         }
     }
 
+    /// Switch to `index` in the listing.
+    fn show(&mut self, index: usize) {
+        if index >= self.paths.len() || index == self.index {
+            return;
+        }
+        self.index = index;
+        self.load(Framing::Reset);
+        self.rewatch();
+        self.menu.follow(index);
+        if let Some(window) = &self.window {
+            window.set_title(&format!("voxview - {}", self.path().display()));
+        }
+    }
+
     /// Move `step` files through the directory listing, wrapping around.
     fn cycle(&mut self, step: isize) {
         if self.paths.len() < 2 {
@@ -217,9 +250,49 @@ impl App {
             return;
         }
         let len = self.paths.len() as isize;
-        self.index = (self.index as isize + step).rem_euclid(len) as usize;
-        self.load(Framing::Reset);
-        self.rewatch();
+        let next = (self.index as isize + step).rem_euclid(len) as usize;
+        self.show(next);
+    }
+
+    /// Move the menu cursor and show whatever it lands on, so arrowing
+    /// through the list previews each file as you pass it.
+    fn step_menu(&mut self, step: isize) {
+        if let Some(index) = self.menu.step(step) {
+            self.show(index);
+        }
+    }
+
+    fn menu_under_cursor(&self) -> Option<Hit> {
+        menu_under_cursor_impl(&self.menu, self.mouse.position)
+    }
+
+    /// Keys the menu claims while it is open. Returns whether it took one.
+    fn menu_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            // Escape undoes the last thing you did: it drops the filter if
+            // there is one, and only then closes the menu.
+            KeyCode::Escape => {
+                if !self.menu.filter_clear(&self.names) {
+                    self.menu.close();
+                }
+            }
+            KeyCode::Tab => self.menu.close(),
+            KeyCode::ArrowUp => self.step_menu(-1),
+            KeyCode::ArrowDown => self.step_menu(1),
+            KeyCode::PageUp => self.step_menu(-self.menu.page()),
+            KeyCode::PageDown => self.step_menu(self.menu.page()),
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                if let Some(index) = self.menu.selection() {
+                    self.show(index);
+                }
+                self.menu.close();
+            }
+            KeyCode::Backspace => {
+                self.menu.filter_pop(&self.names);
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn screenshot(&mut self) {
@@ -246,6 +319,7 @@ impl App {
             ambient_occlusion: self.ambient_occlusion,
             background: self.background,
             hud: &[],
+            menu: &[],
             hud_scale: 1.0,
         };
         let result = self
@@ -312,7 +386,7 @@ impl App {
         )));
         if self.paths.len() > 1 {
             lines.push(HudLine::dim(format!(
-                "file {} of {}  [ ]",
+                "file {} of {}  [ ]  [M]enu",
                 self.index + 1,
                 self.paths.len()
             )));
@@ -339,6 +413,18 @@ impl App {
             .window
             .as_ref()
             .map_or(1.0, |w| w.scale_factor().round().max(1.0) as f32);
+        let menu = if self.menu.is_open() {
+            let (w, h) = self.renderer.as_ref().map_or((1280, 800), Renderer::size);
+            self.menu.lines(
+                &self.names,
+                &self.title,
+                self.index,
+                scale,
+                (w as f32, h as f32),
+            )
+        } else {
+            Vec::new()
+        };
         let params = FrameParams {
             camera: &self.camera,
             show_grid: self.show_grid,
@@ -347,6 +433,7 @@ impl App {
             ambient_occlusion: self.ambient_occlusion,
             background: self.background,
             hud: &hud,
+            menu: &menu,
             hud_scale: scale,
         };
         if let Some(renderer) = &mut self.renderer {
@@ -373,6 +460,7 @@ impl App {
             KeyCode::KeyO => self.ambient_occlusion = !self.ambient_occlusion,
             KeyCode::KeyT => self.background = self.background.toggled(),
             KeyCode::KeyP => self.screenshot(),
+            KeyCode::KeyM | KeyCode::Tab => self.menu.toggle(&self.names, self.index),
             KeyCode::BracketLeft => self.cycle(-1),
             KeyCode::BracketRight => self.cycle(1),
             KeyCode::KeyR => {
@@ -426,15 +514,43 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed
-                    && !event.repeat
-                    && let PhysicalKey::Code(code) = event.physical_key
-                {
+                if event.state != ElementState::Pressed || event.repeat {
+                    return;
+                }
+                let code = match event.physical_key {
+                    PhysicalKey::Code(code) => Some(code),
+                    _ => None,
+                };
+                if self.menu.is_open() {
+                    if code.is_some_and(|c| self.menu_key(c)) {
+                        return;
+                    }
+                    // Anything else printable spells a filter. The overlay
+                    // shortcuts are single letters, so they have to give way
+                    // while the menu has the keyboard.
+                    if let Some(c) = event.text.as_deref().and_then(printable) {
+                        self.menu.filter_push(c, &self.names);
+                        return;
+                    }
+                }
+                if let Some(code) = code {
                     self.key(code, event_loop);
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
+                // A press inside the menu picks a file; it must not also start
+                // an orbit, so it is swallowed here and never reaches `Mouse`.
+                if down && button == MouseButton::Left {
+                    match self.menu_under_cursor() {
+                        Some(Hit::Row(index)) => {
+                            self.show(index);
+                            return;
+                        }
+                        Some(Hit::Panel) => return,
+                        None => {}
+                    }
+                }
                 match button {
                     MouseButton::Left => self.mouse.left = down,
                     MouseButton::Right | MouseButton::Middle => self.mouse.pan = down,
@@ -466,7 +582,13 @@ impl ApplicationHandler for App {
                     // Touchpads report pixels; 50 of them feels like one notch.
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
                 };
-                self.camera.zoom(notches);
+                if self.menu_under_cursor().is_some() {
+                    // Scrolling the list moves the view without moving the
+                    // cursor, so it does not load a file per notch.
+                    self.menu.scroll_by(-(notches * WHEEL_ROWS as f32) as isize);
+                } else {
+                    self.camera.zoom(notches);
+                }
             }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
@@ -478,6 +600,31 @@ impl ApplicationHandler for App {
             window.request_redraw();
         }
     }
+}
+
+/// What the menu has under the cursor, if anything.
+fn menu_under_cursor_impl(menu: &Menu, at: PhysicalPosition<f64>) -> Option<Hit> {
+    menu.hit(at.x as f32, at.y as f32)
+}
+
+/// The single character a key press contributes to the filter.
+///
+/// Dead keys and IME sequences deliver more than one character at a time;
+/// a file filter is plain text, so anything exotic is dropped rather than
+/// half-applied.
+fn printable(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() || c.is_control() {
+        return None;
+    }
+    Some(c)
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn on_off(b: bool) -> &'static str {

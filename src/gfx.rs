@@ -11,7 +11,7 @@
 //! vertices.
 
 use crate::camera::OrbitCamera;
-use crate::hud::{self, HudLine, HudVertex};
+use crate::hud::{self, Anchor, HudLine, HudVertex};
 use crate::loader::VoxScene;
 use crate::mesh::{Mesh, Vertex};
 use crate::overlay::{self, LineVertex, Overlays};
@@ -68,6 +68,8 @@ pub struct FrameParams<'a> {
     pub ambient_occlusion: bool,
     pub background: Background,
     pub hud: &'a [HudLine],
+    /// The file menu, anchored to the opposite corner. Empty when closed.
+    pub menu: &'a [HudLine],
     /// Integer pixel scale for HUD text.
     pub hud_scale: f32,
 }
@@ -535,6 +537,7 @@ impl Renderer {
             ambient_occlusion: params.ambient_occlusion,
             background: params.background,
             hud: &[],
+            menu: &[],
             hud_scale: params.hud_scale,
         };
         self.prepare(&clean);
@@ -643,7 +646,14 @@ impl Renderer {
         self.queue
             .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
 
-        let mesh = hud::layout(params.hud, params.hud_scale);
+        let viewport = (self.config.width as f32, self.config.height as f32);
+        let mut mesh = hud::layout(params.hud, params.hud_scale, Anchor::TopLeft, viewport);
+        mesh.append(&hud::layout(
+            params.menu,
+            params.hud_scale,
+            Anchor::TopRight,
+            viewport,
+        ));
         self.hud_index_count = mesh.indices.len() as u32;
         if !mesh.is_empty() {
             self.hud_vertices.write(

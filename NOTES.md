@@ -113,6 +113,19 @@ carries both a depth limit and a visiting set.
   ranges; `multiview` is now `multiview_mask`. Older examples on the web do not
   compile against it.
 
+* **The file menu takes the whole keyboard while it is open.** The viewer's
+  shortcuts are bare single letters, and a filter box needs those same letters,
+  so there is no arrangement in which both work at once. The menu wins while it
+  is open, and the HUD keeps showing the toggle states so it is obvious the
+  keys have not been lost. Requiring a modifier for the filter would have been
+  the alternative; it makes the common case worse to keep the rare one.
+
+* **Menu hit-testing shares its arithmetic with menu layout.** Both go through
+  `hud::Metrics`, and a test checks the row tops it reports against the glyph
+  positions `hud::layout` actually emits. Two copies of the padding maths drift
+  the first time one of them changes, and the symptom -- clicks landing one row
+  off -- is easy to misread as an input bug.
+
 * **A pipeline's depth state must match the pass, even when it ignores depth.**
   The HUD draws last and wants no depth testing, but it shares a render pass
   with the model, so it has to declare the same depth format with
