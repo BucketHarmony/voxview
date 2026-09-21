@@ -1,0 +1,34 @@
+[package]
+name = "voxview"
+version = "0.1.0"
+edition = "2024"
+description = "A standalone MagicaVoxel .vox viewer"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "voxview"
+path = "src/lib.rs"
+
+[[bin]]
+name = "voxview"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+bytemuck = { version = "1.25", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
+dot_vox = "5.2"
+glam = "0.33"
+image = { version = "0.25", default-features = false, features = ["png"] }
+notify = "8.2"
+pollster = "0.4"
+wgpu = "30.0"
+winit = "0.30"
+
+[profile.release]
+opt-level = 3
+
+# Debug builds of the mesher are ~20x slower than release; bump the optimisation
+# level of dependencies and of our own code enough that `cargo test` stays quick.
+[profile.test]
+opt-level = 2
