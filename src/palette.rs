@@ -4,6 +4,19 @@
 //! `XYZI` are 1-based in the file; `dot_vox` has already subtracted one by the
 //! time we see them, so `Palette::color(voxel.i)` is a direct lookup.
 
+/// Convert one sRGB-encoded channel in `0..=1` to linear light.
+///
+/// Surfaces are created with an sRGB format, so the GPU encodes whatever a
+/// shader writes. Colours therefore have to reach the shader already linear,
+/// or everything comes out washed out.
+pub fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 /// A single palette entry, stored as linear-order RGBA bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgba(pub [u8; 4]);
@@ -60,6 +73,20 @@ impl Palette {
     /// Colour for a 0-based voxel palette index.
     pub fn color(&self, index: u8) -> Rgba {
         self.entries[index as usize]
+    }
+
+    /// All 256 entries as linear `vec4`s, ready to be a GPU uniform.
+    pub fn to_linear_rgba(&self) -> [[f32; 4]; 256] {
+        let mut out = [[0.0f32; 4]; 256];
+        for (dst, src) in out.iter_mut().zip(self.entries.iter()) {
+            *dst = [
+                srgb_to_linear(src.0[0] as f32 / 255.0),
+                srgb_to_linear(src.0[1] as f32 / 255.0),
+                srgb_to_linear(src.0[2] as f32 / 255.0),
+                src.0[3] as f32 / 255.0,
+            ];
+        }
+        out
     }
 
     /// Flat `r, g, b, a` bytes for all 256 entries, for upload to the GPU.
@@ -154,6 +181,14 @@ mod tests {
             Palette::magicavoxel_default().color(255).to_array()
         );
         assert!(p.from_file);
+    }
+
+    #[test]
+    fn srgb_conversion_hits_the_endpoints() {
+        assert!((srgb_to_linear(0.0)).abs() < 1e-6);
+        assert!((srgb_to_linear(1.0) - 1.0).abs() < 1e-6);
+        // Mid grey is much darker in linear light than its sRGB code suggests.
+        assert!(srgb_to_linear(0.5) < 0.25);
     }
 
     #[test]

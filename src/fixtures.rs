@@ -14,7 +14,10 @@ use glam::IVec3;
 use std::path::Path;
 
 /// Names and builders for every fixture, in the order they are written.
-pub const FIXTURES: &[(&str, fn() -> DotVoxData)] = &[
+/// A fixture: the file name to write it under, and how to build it.
+pub type Fixture = (&'static str, fn() -> DotVoxData);
+
+pub const FIXTURES: &[Fixture] = &[
     ("cube.vox", single_cube),
     ("checker.vox", checkerboard_8),
     ("two_models.vox", two_models_translated),

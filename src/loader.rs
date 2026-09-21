@@ -35,8 +35,8 @@ impl VoxScene {
 
 /// Read and parse a `.vox` file.
 pub fn load_file(path: &Path) -> Result<VoxScene> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("could not read {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
     load_bytes(&bytes).with_context(|| format!("could not parse {}", path.display()))
 }
 
@@ -129,9 +129,9 @@ pub fn collect_vox_paths(arg: &Path) -> Result<(Vec<std::path::PathBuf>, usize)>
             .filter(|p| !p.as_os_str().is_empty())
             .and_then(|dir| list_vox_dir(dir).ok())
             .unwrap_or_default();
-        let index = siblings.iter().position(|p| {
-            std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()) == canonical
-        });
+        let index = siblings
+            .iter()
+            .position(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()) == canonical);
         match index {
             Some(i) => Ok((siblings, i)),
             // The named file is not a `.vox` by extension, or lives somewhere
@@ -146,11 +146,7 @@ fn list_vox_dir(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
         .with_context(|| format!("could not list {}", dir.display()))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("vox"))
-        })
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("vox")))
         .collect();
     files.sort();
     Ok(files)

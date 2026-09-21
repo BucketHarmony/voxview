@@ -6,8 +6,8 @@
 //!
 //! Coordinates are MagicaVoxel's own: right-handed, Z up, one unit per voxel.
 
-use glam::{IVec3, Mat3, Mat4, Vec3};
 use dot_vox::Dict;
+use glam::{IVec3, Mat3, Mat4, Vec3};
 
 /// A signed permutation matrix -- the only rotation `.vox` can express.
 ///
