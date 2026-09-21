@@ -8,7 +8,7 @@ use voxview::loader;
 #[command(name = "voxview", version, about, long_about = None)]
 struct Args {
     /// A `.vox` file, or a directory to page through with `[` and `]`.
-    path: PathBuf,
+    path: Option<PathBuf>,
 
     /// Print a summary of the file and exit without opening a window.
     #[arg(long)]
@@ -35,10 +35,17 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let (paths, index) = loader::collect_vox_paths(&args.path)?;
-    let scene = loader::load_file(&paths[index])?;
-    print_stats(&paths[index], &scene);
-    Ok(())
+    let path = args
+        .path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("a .vox file or directory is required"))?;
+    let (paths, index) = loader::collect_vox_paths(path)?;
+    if args.stats {
+        let scene = loader::load_file(&paths[index])?;
+        print_stats(&paths[index], &scene);
+        return Ok(());
+    }
+    voxview::app::run(paths, index)
 }
 
 fn print_stats(path: &std::path::Path, scene: &loader::VoxScene) {
@@ -62,7 +69,10 @@ fn print_stats(path: &std::path::Path, scene: &loader::VoxScene) {
             "MagicaVoxel default"
         }
     );
-    println!("  materials     {} (read, not rendered)", scene.material_count);
+    println!(
+        "  materials     {} (read, not rendered)",
+        scene.material_count
+    );
     for (i, m) in scene.models.iter().enumerate() {
         let s = m.size();
         println!(
