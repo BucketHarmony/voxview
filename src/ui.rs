@@ -96,6 +96,15 @@ pub struct Ui {
     /// Set by `/` so the find field takes focus on the next frame.
     focus_find: bool,
     new_collection: String,
+    /// Columns the grid laid out last frame, so the arrow keys know what a
+    /// row is worth.
+    columns: usize,
+    /// A row the keyboard moved to that the scroll area has yet to reveal.
+    pending_scroll: Option<usize>,
+    /// `Space`: the focused asset, large, without leaving the grid.
+    peek: bool,
+    /// `C`: choose a collection for the selection.
+    prompt: bool,
     /// Collected during a frame, returned from [`Ui::frame`].
     actions: Vec<Action>,
 }
@@ -122,6 +131,10 @@ impl Ui {
             thumbs: Thumbs::new(),
             focus_find: false,
             new_collection: String::new(),
+            columns: 1,
+            pending_scroll: None,
+            peek: false,
+            prompt: false,
             actions: Vec::new(),
         }
     }
@@ -145,6 +158,34 @@ impl Ui {
 
     pub fn focus_find(&mut self) {
         self.focus_find = true;
+    }
+
+    /// How many cells the grid fitted across last frame. One in list view, so
+    /// up and down move a single row either way.
+    pub fn columns(&self) -> usize {
+        self.columns.max(1)
+    }
+
+    /// Bring a row into view on the next frame.
+    pub fn scroll_to_row(&mut self, row: usize) {
+        self.pending_scroll = Some(row);
+    }
+
+    pub fn toggle_peek(&mut self) {
+        self.peek = !self.peek;
+    }
+
+    /// Dismiss whatever overlay is up. Returns true if there was one, so
+    /// `Esc` closes it before it means anything else.
+    pub fn close_overlay(&mut self) -> bool {
+        let was = self.peek || self.prompt;
+        self.peek = false;
+        self.prompt = false;
+        was
+    }
+
+    pub fn prompt_collection(&mut self) {
+        self.prompt = true;
     }
 
     /// Build one frame of UI and hand back what to draw and what to do.
@@ -196,6 +237,157 @@ impl Ui {
                     View::List => self.list(ui, lib),
                 }
             });
+
+        if self.peek {
+            self.peek_overlay(ui, lib);
+        }
+        if self.prompt {
+            self.collection_prompt(ui, lib);
+        }
+    }
+
+    /// `Space`: the focused asset at a size you can actually judge, over the
+    /// grid rather than instead of it, so it costs nothing to dismiss.
+    fn peek_overlay(&mut self, ui: &mut egui::Ui, lib: &Library) {
+        let Some(asset) = lib.focused() else {
+            self.peek = false;
+            return;
+        };
+        let path = lib.assets[asset].path.clone();
+        let name = lib.assets[asset].name.clone();
+        let folder = lib.relative(asset);
+        let detail = match &lib.assets[asset].load {
+            Load::Ready(stats) => format!(
+                "{} \u{d7} {} \u{d7} {}   {} voxels",
+                stats.dims[0],
+                stats.dims[1],
+                stats.dims[2],
+                thousands(stats.voxels)
+            ),
+            Load::Pending => "reading\u{2026}".into(),
+            Load::Failed(why) => why.clone(),
+        };
+
+        egui::Area::new(egui::Id::new("peek"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(&ui.ctx().clone(), |ui| {
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.0, EDGE))
+                    .corner_radius(12.0)
+                    .inner_margin(16)
+                    .show(ui, |ui| {
+                        let side = 420.0;
+                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(side), Sense::hover());
+                        ui.painter().rect_filled(rect, 8.0, BAR);
+                        match self.thumbs.get(&path) {
+                            Some(texture) => {
+                                ui.painter().image(
+                                    texture.id(),
+                                    rect.shrink(12.0),
+                                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                            }
+                            None => placeholder(ui.painter(), rect.center(), 22.0, EDGE),
+                        }
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new(name).size(15.0).strong().color(TEXT));
+                        ui.label(
+                            egui::RichText::new(folder)
+                                .monospace()
+                                .size(10.5)
+                                .color(FAINT),
+                        );
+                        ui.label(
+                            egui::RichText::new(detail)
+                                .monospace()
+                                .size(11.5)
+                                .color(DIM),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("Space to close  \u{b7}  Enter to open")
+                                .size(10.5)
+                                .color(FAINT),
+                        );
+                    });
+            });
+    }
+
+    /// `C`: put the selection in a collection, existing or new.
+    fn collection_prompt(&mut self, ui: &mut egui::Ui, lib: &mut Library) {
+        let targets: Vec<usize> = if lib.selection.is_empty() {
+            lib.focused().into_iter().collect()
+        } else {
+            lib.selection.clone()
+        };
+        if targets.is_empty() {
+            self.prompt = false;
+            return;
+        }
+
+        let mut close = false;
+        egui::Area::new(egui::Id::new("collection-prompt"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(&ui.ctx().clone(), |ui| {
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.0, EDGE))
+                    .corner_radius(12.0)
+                    .inner_margin(16)
+                    .show(ui, |ui| {
+                        ui.set_width(300.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Add {} asset{} to",
+                                targets.len(),
+                                if targets.len() == 1 { "" } else { "s" }
+                            ))
+                            .size(13.0)
+                            .color(TEXT),
+                        );
+                        ui.add_space(8.0);
+                        let mut chosen = None;
+                        for (i, collection) in lib.collections.iter().enumerate() {
+                            let label =
+                                format!("{}   {}", collection.name, collection.members.len());
+                            if ui.button(label).clicked() {
+                                chosen = Some(i);
+                            }
+                        }
+                        if !lib.collections.is_empty() {
+                            ui.add_space(8.0);
+                        }
+                        ui.horizontal(|ui| {
+                            let field = ui.add(
+                                egui::TextEdit::singleline(&mut self.new_collection)
+                                    .desired_width(180.0)
+                                    .hint_text("new collection"),
+                            );
+                            field.request_focus();
+                            let entered =
+                                field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if (entered || ui.button("Create").clicked())
+                                && !self.new_collection.trim().is_empty()
+                            {
+                                let name = std::mem::take(&mut self.new_collection);
+                                chosen = Some(lib.new_collection(name));
+                            }
+                        });
+                        if let Some(i) = chosen {
+                            lib.add_to_collection(i, &targets);
+                            close = true;
+                        }
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("Esc to cancel").size(10.5).color(FAINT));
+                    });
+            });
+        if close {
+            self.prompt = false;
+        }
     }
 
     fn title_bar(&mut self, ui: &mut egui::Ui, lib: &Library, status: ScanStatus) {
@@ -259,7 +451,7 @@ impl Ui {
                     && let Some(collection) = lib.collections.get(c)
                 {
                     ui.label(
-                        egui::RichText::new(format!("\u{25c6} {}", collection.name))
+                        egui::RichText::new(collection.name.clone())
                             .size(12.0)
                             .color(TEXT),
                     );
@@ -275,18 +467,10 @@ impl Ui {
                     ui.label(egui::RichText::new("Size").size(11.0).color(DIM));
 
                     let list = lib.view == View::List;
-                    if ui
-                        .selectable_label(list, "\u{2630}")
-                        .on_hover_text("List (V)")
-                        .clicked()
-                    {
+                    if ui.selectable_label(list, "List").clicked() {
                         lib.view = View::List;
                     }
-                    if ui
-                        .selectable_label(!list, "\u{25a6}")
-                        .on_hover_text("Grid (V)")
-                        .clicked()
-                    {
+                    if ui.selectable_label(!list, "Grid").clicked() {
                         lib.view = View::Grid;
                     }
 
@@ -392,14 +576,7 @@ impl Ui {
                         }
                         let x = rect.left() + 8.0 + row.depth as f32 * 13.0;
                         if row.has_children {
-                            let caret = if row.expanded { "\u{25be}" } else { "\u{25b8}" };
-                            painter.text(
-                                pos2(x, rect.center().y),
-                                Align2::LEFT_CENTER,
-                                caret,
-                                FontId::proportional(9.0),
-                                FAINT,
-                            );
+                            caret(painter, pos2(x + 4.0, rect.center().y), row.expanded, FAINT);
                         }
                         painter.text(
                             pos2(x + 14.0, rect.center().y),
@@ -461,11 +638,8 @@ impl Ui {
                     let mut pick = None;
                     for (i, collection) in lib.collections.iter().enumerate() {
                         let current = lib.scope == Scope::Collection(i);
-                        let label = format!(
-                            "\u{25c6} {}   {}",
-                            collection.name,
-                            collection.members.len()
-                        );
+                        let label =
+                            format!("{}   {}", collection.name, collection.members.len());
                         if ui.selectable_label(current, label).clicked() {
                             pick = Some(i);
                         }
@@ -573,11 +747,7 @@ impl Ui {
                         }
                     }
                 });
-            let arrow = if lib.descending {
-                "\u{25be}"
-            } else {
-                "\u{25b4}"
-            };
+            let arrow = if lib.descending { "desc" } else { "asc" };
             if ui.small_button(arrow).clicked() {
                 lib.descending = !lib.descending;
                 lib.invalidate();
@@ -630,26 +800,32 @@ impl Ui {
         let columns = ((width + GAP) / (cell + GAP)).floor().max(1.0) as usize;
         let lines = rows.len().div_ceil(columns);
         let line_height = cell + CAPTION + GAP;
+        self.columns = columns;
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .show_rows(ui, line_height, lines, |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for line in range {
-                    let (strip, _) = ui.allocate_exact_size(
-                        vec2(ui.available_width(), line_height),
-                        Sense::hover(),
-                    );
-                    for column in 0..columns {
-                        let Some(row) = rows.get(line * columns + column) else {
-                            break;
-                        };
-                        let origin = strip.min + vec2(GAP + column as f32 * (cell + GAP), 0.0);
-                        let rect = Rect::from_min_size(origin, vec2(cell, cell + CAPTION));
-                        self.cell(ui, lib, row, rect);
-                    }
+        let mut area = egui::ScrollArea::vertical().auto_shrink([false; 2]);
+        if let Some(row) = self.pending_scroll.take() {
+            area = area.vertical_scroll_offset(offset_for(
+                row / columns,
+                line_height,
+                lines,
+                ui.available_height(),
+            ));
+        }
+        area.show_rows(ui, line_height, lines, |ui, range| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for line in range {
+                let (strip, _) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), line_height), Sense::hover());
+                for column in 0..columns {
+                    let Some(row) = rows.get(line * columns + column) else {
+                        break;
+                    };
+                    let origin = strip.min + vec2(GAP + column as f32 * (cell + GAP), 0.0);
+                    let rect = Rect::from_min_size(origin, vec2(cell, cell + CAPTION));
+                    self.cell(ui, lib, row, rect);
                 }
-            });
+            }
+        });
     }
 
     fn cell(&mut self, ui: &mut egui::Ui, lib: &mut Library, row: &Row, rect: Rect) {
@@ -694,19 +870,11 @@ impl Ui {
                 );
             }
             None => {
-                let failed = lib.assets[asset].failed() || self.thumbs.is_failed(&path);
-                let (glyph, colour) = if failed {
-                    ("\u{26a0}", BAD)
+                if lib.assets[asset].failed() || self.thumbs.is_failed(&path) {
+                    warning(painter, thumb.center(), 22.0, BAD);
                 } else {
-                    ("\u{25cc}", EDGE)
-                };
-                painter.text(
-                    thumb.center(),
-                    Align2::CENTER_CENTER,
-                    glyph,
-                    FontId::proportional(24.0),
-                    colour,
-                );
+                    placeholder(painter, thumb.center(), 13.0, EDGE);
+                }
             }
         }
 
@@ -715,7 +883,7 @@ impl Ui {
                 painter,
                 pos2(thumb.right() - 7.0, thumb.bottom() - 7.0),
                 Align2::RIGHT_BOTTOM,
-                &format!("\u{25e7} {}", members.len()),
+                &format!("\u{d7}{}", members.len()),
                 Color32::from_rgba_unmultiplied(0x10, 0x12, 0x15, 0xD9),
                 TEXT,
             );
@@ -726,7 +894,7 @@ impl Ui {
                 painter,
                 pos2(thumb.left() + 7.0, thumb.top() + 7.0),
                 Align2::LEFT_TOP,
-                &format!("\u{25c6} {first}"),
+                first,
                 Color32::from_rgb(0x22, 0x30, 0x4B),
                 Color32::from_rgb(0xBB, 0xD0, 0xF0),
             );
@@ -735,8 +903,12 @@ impl Ui {
         // Caption. The tail of a name is what distinguishes siblings, so it is
         // the part that has to survive: wrap rather than elide.
         let label = match row {
-            Row::Family { key, members } => format!("{key}\u{2009}*  ({})", members.len()),
+            Row::Family { key, members } => format!("{key}-*  ({})", members.len()),
             Row::One(_) => lib.assets[asset].name.clone(),
+        };
+        let label = match lib.folder_hint(asset) {
+            Some(folder) => format!("{folder}/{label}"),
+            None => label,
         };
         let galley = wrapped(painter, &label, 12.0, TEXT, rect.width() - 4.0, 2);
         painter.galley(pos2(rect.left() + 2.0, thumb.bottom() + 6.0), galley, TEXT);
@@ -789,6 +961,7 @@ impl Ui {
             } else {
                 lib.click(asset, ctrl, shift);
             }
+            lib.focus_row(asset);
         }
     }
 
@@ -800,6 +973,7 @@ impl Ui {
             self.empty(ui, lib);
             return;
         }
+        self.columns = 1;
         let columns = [0.0f32, 300.0, 400.0, 480.0, 560.0];
         ui.horizontal(|ui| {
             ui.add_space(GAP);
@@ -820,20 +994,27 @@ impl Ui {
             ui.add_space(16.0);
         });
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .show_rows(ui, LIST_ROW, rows.len(), |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for index in range {
-                    let row = &rows[index];
-                    let (rect, response) = ui
-                        .allocate_exact_size(vec2(ui.available_width(), LIST_ROW), Sense::click());
-                    let id = ui.id().with(("list", index));
-                    let response = response.union(ui.interact(rect, id, Sense::click()));
-                    self.list_row(ui, lib, row, rect, &response, &columns);
-                    self.cell_input(ui, lib, row, &response);
-                }
-            });
+        let mut area = egui::ScrollArea::vertical().auto_shrink([false; 2]);
+        if let Some(row) = self.pending_scroll.take() {
+            area = area.vertical_scroll_offset(offset_for(
+                row,
+                LIST_ROW,
+                rows.len(),
+                ui.available_height(),
+            ));
+        }
+        area.show_rows(ui, LIST_ROW, rows.len(), |ui, range| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for index in range {
+                let row = &rows[index];
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), LIST_ROW), Sense::click());
+                let id = ui.id().with(("list", index));
+                let response = response.union(ui.interact(rect, id, Sense::click()));
+                self.list_row(ui, lib, row, rect, &response, &columns);
+                self.cell_input(ui, lib, row, &response);
+            }
+        });
     }
 
     fn list_row(
@@ -866,24 +1047,10 @@ impl Ui {
         let mut x = left + indent;
         match row {
             Row::Family { key, members } => {
-                let caret = if lib.family_expanded(row) {
-                    "\u{25be}"
-                } else {
-                    "\u{25b8}"
-                };
-                painter.text(
-                    pos2(x, y),
-                    Align2::LEFT_CENTER,
-                    caret,
-                    FontId::proportional(9.0),
-                    DIM,
-                );
+                caret(painter, pos2(x + 4.0, y), lib.family_expanded(row), DIM);
                 x += 14.0;
-                let galley = painter.layout_no_wrap(
-                    format!("{key}\u{2009}*"),
-                    FontId::proportional(12.5),
-                    TEXT,
-                );
+                let galley =
+                    painter.layout_no_wrap(format!("{key}-*"), FontId::proportional(12.5), TEXT);
                 painter.galley(pos2(x, y - galley.size().y * 0.5), galley, TEXT);
                 painter.text(
                     pos2(x + 200.0, y),
@@ -1008,15 +1175,7 @@ impl Ui {
                             Color32::WHITE,
                         );
                     }
-                    None => {
-                        ui.painter().text(
-                            rect.center(),
-                            Align2::CENTER_CENTER,
-                            "\u{25cc}",
-                            FontId::proportional(28.0),
-                            EDGE,
-                        );
-                    }
+                    None => placeholder(ui.painter(), rect.center(), 18.0, EDGE),
                 }
 
                 ui.add_space(12.0);
@@ -1144,7 +1303,7 @@ impl Ui {
                             }
                         });
                         if ui
-                            .button("\u{2b1a} PNG")
+                            .button("Save PNG")
                             .on_hover_text("Save a PNG next to each selected model")
                             .clicked()
                         {
@@ -1182,7 +1341,7 @@ impl Ui {
                                 .color(DIM),
                         );
                     }
-                    if ui.button("\u{25a6} Library  Esc").clicked() {
+                    if ui.button("Library  Esc").clicked() {
                         self.actions.push(Action::ToLibrary);
                     }
                 });
@@ -1434,6 +1593,53 @@ fn facet_row(ui: &mut egui::Ui, label: &str, count: usize, on: &mut bool) -> boo
     changed
 }
 
+/// A disclosure triangle, pointing right when closed and down when open.
+///
+/// Painted rather than typed. egui's default font carries no geometric
+/// shapes, so `\u{25b8}` and its neighbours come out as hollow boxes.
+fn caret(painter: &egui::Painter, centre: egui::Pos2, open: bool, colour: Color32) {
+    let r = 3.6;
+    let points = if open {
+        vec![
+            pos2(centre.x - r, centre.y - r * 0.7),
+            pos2(centre.x + r, centre.y - r * 0.7),
+            pos2(centre.x, centre.y + r * 0.8),
+        ]
+    } else {
+        vec![
+            pos2(centre.x - r * 0.7, centre.y - r),
+            pos2(centre.x + r * 0.8, centre.y),
+            pos2(centre.x - r * 0.7, centre.y + r),
+        ]
+    };
+    painter.add(egui::Shape::convex_polygon(points, colour, Stroke::NONE));
+}
+
+/// The ring that stands in for a thumbnail that has not been drawn yet.
+fn placeholder(painter: &egui::Painter, centre: egui::Pos2, radius: f32, colour: Color32) {
+    painter.circle_stroke(centre, radius, Stroke::new(1.5, colour));
+}
+
+/// The marker for a file that would not parse.
+fn warning(painter: &egui::Painter, centre: egui::Pos2, size: f32, colour: Color32) {
+    let h = size * 0.5;
+    painter.add(egui::Shape::closed_line(
+        vec![
+            pos2(centre.x, centre.y - h),
+            pos2(centre.x + h, centre.y + h * 0.75),
+            pos2(centre.x - h, centre.y + h * 0.75),
+        ],
+        Stroke::new(1.5, colour),
+    ));
+    painter.text(
+        centre + vec2(0.0, 2.0),
+        Align2::CENTER_CENTER,
+        "!",
+        FontId::proportional(size * 0.55),
+        colour,
+    );
+}
+
 fn swatches(ui: &mut egui::Ui, colours: &[[u8; 3]]) {
     let width = ui.available_width();
     let per_row = 16;
@@ -1505,6 +1711,14 @@ fn extent_of(lib: &Library, row: &Row) -> Option<String> {
     ))
 }
 
+/// Where to scroll so `line` sits a third of the way down, which reads better
+/// than dead centre when you are arrowing forward through a folder.
+fn offset_for(line: usize, line_height: f32, lines: usize, viewport: f32) -> f32 {
+    let total = lines as f32 * line_height;
+    let wanted = line as f32 * line_height - viewport / 3.0;
+    wanted.clamp(0.0, (total - viewport).max(0.0))
+}
+
 fn bytes(n: u64) -> String {
     if n < 1024 {
         format!("{n} B")
@@ -1557,6 +1771,16 @@ mod tests {
         lib.assets[0].load = ready([11, 11, 10]);
         let rows = lib.rows().to_vec();
         assert_eq!(extent_of(&lib, &rows[0]), None);
+    }
+
+    #[test]
+    fn scrolling_to_a_row_stays_inside_the_scroll_area() {
+        // Near the top there is nothing above to show, and at the end the
+        // last screenful must not scroll past its own bottom.
+        assert_eq!(offset_for(0, 100.0, 50, 600.0), 0.0);
+        assert_eq!(offset_for(1, 100.0, 50, 600.0), 0.0);
+        assert_eq!(offset_for(49, 100.0, 50, 600.0), 4400.0);
+        assert_eq!(offset_for(5, 100.0, 3, 600.0), 0.0);
     }
 
     #[test]

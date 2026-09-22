@@ -3,9 +3,12 @@
 use crate::camera::OrbitCamera;
 use crate::gfx::{Background, FrameParams, Renderer};
 use crate::hud::HudLine;
+use crate::library::{Library, Scope, View};
 use crate::loader::{self, VoxScene};
 use crate::menu::{Hit, Menu};
 use crate::mesh;
+use crate::scan::{self, Scan};
+use crate::ui::{Action, Chrome, ScanStatus, Toggle, Ui, ViewerChrome};
 use crate::watch::FileWatcher;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -18,19 +21,32 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-/// Open the viewer on `paths[index]`.
-pub fn run(paths: Vec<PathBuf>, index: usize) -> Result<()> {
+/// Open voxview on `paths[index]`, browsing `root`.
+///
+/// A directory argument opens the library; a file argument opens that file
+/// and leaves the library a keystroke away.
+pub fn run(root: PathBuf, paths: Vec<PathBuf>, index: usize, browse: bool) -> Result<()> {
     let event_loop = EventLoop::new().context("could not create an event loop")?;
     // Redraw continuously: the swapchain is in Fifo mode, so this paces
     // itself at the display's refresh rate rather than spinning.
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(paths, index);
+    let mut app = App::new(root, paths, index, browse);
     event_loop.run_app(&mut app).context("the viewer stopped")?;
     match app.fatal.take() {
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Which face of the program is up.
+///
+/// They share one window, one device and one set of thumbnails; only the
+/// input routing and what gets drawn differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Library,
+    Viewer,
 }
 
 /// What to do with the camera when new geometry arrives.
@@ -109,6 +125,20 @@ struct Mouse {
 }
 
 struct App {
+    mode: Mode,
+    /// Where the library browses from. Not necessarily the file's own folder:
+    /// a directory argument browses its whole subtree.
+    root: PathBuf,
+    lib: Library,
+    scan: Option<Scan>,
+    /// Names found, and files parsed, for the status bar.
+    found: usize,
+    parsed: usize,
+    ui: Option<Ui>,
+    /// The library index of whatever the viewer is showing, so the filmstrip
+    /// knows where it is.
+    current: Option<usize>,
+
     paths: Vec<PathBuf>,
     index: usize,
     /// File names for the menu, built once: the listing does not change while
@@ -135,6 +165,9 @@ struct App {
     background: Background,
 
     mouse: Mouse,
+    /// Modifier state, which only arrives in its own event on winit.
+    shift: bool,
+    ctrl: bool,
     fps: Fps,
     status: Option<(String, Instant)>,
     /// An error that should make the process exit non-zero.
@@ -145,9 +178,12 @@ struct App {
 const STATUS_SECONDS: f32 = 4.0;
 /// File rows one notch of the wheel scrolls the menu by.
 const WHEEL_ROWS: usize = 3;
+/// Edge of a PNG written from the library, where there is no viewport to
+/// borrow a size from.
+const SHOT_SIZE: u32 = 512;
 
 impl App {
-    fn new(paths: Vec<PathBuf>, index: usize) -> App {
+    fn new(root: PathBuf, paths: Vec<PathBuf>, index: usize, browse: bool) -> App {
         let names = paths.iter().map(|p| file_name(p)).collect();
         let title = paths
             .first()
@@ -156,6 +192,14 @@ impl App {
             .map(file_name)
             .unwrap_or_else(|| ".".into());
         App {
+            mode: if browse { Mode::Library } else { Mode::Viewer },
+            lib: Library::new(root.clone(), Vec::new()),
+            root,
+            scan: None,
+            found: 0,
+            parsed: 0,
+            ui: None,
+            current: None,
             paths,
             index,
             names,
@@ -173,6 +217,8 @@ impl App {
             ambient_occlusion: true,
             background: Background::Dark,
             mouse: Mouse::default(),
+            shift: false,
+            ctrl: false,
             fps: Fps::new(),
             status: None,
             fatal: None,
@@ -181,6 +227,167 @@ impl App {
 
     fn path(&self) -> &Path {
         &self.paths[self.index]
+    }
+
+    /// Take in whatever the background scan has produced since the last frame.
+    ///
+    /// The walk arrives first, in one message, and rebuilds the tree; the
+    /// per-file stats trickle in after it and fill the cells in place.
+    fn drain_scan(&mut self) {
+        let Some(scan) = &mut self.scan else { return };
+        let messages = scan.drain();
+        if messages.is_empty() {
+            return;
+        }
+        let mut touched = false;
+        for message in messages {
+            match message {
+                scan::Msg::Found {
+                    files,
+                    skipped,
+                    truncated,
+                } => {
+                    self.found = files.len();
+                    // Rebuilding is the honest way to fold a whole walk into
+                    // the tree, so the few settings you could have reached in
+                    // that first moment are carried across by hand.
+                    let mut lib = Library::new(self.root.clone(), files);
+                    lib.view = self.lib.view;
+                    lib.sort = self.lib.sort;
+                    lib.descending = self.lib.descending;
+                    lib.stack_variants = self.lib.stack_variants;
+                    lib.cell = self.lib.cell;
+                    lib.skipped = skipped;
+                    lib.truncated = truncated;
+                    self.lib = lib;
+                    self.sync_current();
+                    touched = true;
+                }
+                scan::Msg::Stats { path, load } => {
+                    self.parsed += 1;
+                    self.lib.apply(&path, load);
+                    touched = true;
+                }
+                scan::Msg::Done => {}
+            }
+        }
+        if touched {
+            // Extent and palette facets depend on the stats, so the row list
+            // and the counts are stale as soon as any of them lands.
+            self.lib.invalidate();
+        }
+    }
+
+    /// Say in the title bar which face is up and what it is looking at.
+    fn retitle(&self) {
+        let Some(window) = &self.window else { return };
+        window.set_title(&match self.mode {
+            Mode::Library => format!("voxview - {}", self.root.display()),
+            Mode::Viewer => format!("voxview - {}", self.path().display()),
+        });
+    }
+
+    /// Find the library entry for the file the viewer is showing.
+    fn sync_current(&mut self) {
+        let path = self.path().to_path_buf();
+        self.current = self.lib.assets.iter().position(|a| a.path == path);
+    }
+
+    /// Show a library asset in the viewer, with `[` and `]` walking whatever
+    /// the library was filtered down to.
+    fn open(&mut self, asset: usize) {
+        let order = self.lib.filtered();
+        let Some(position) = order.iter().position(|i| *i == asset) else {
+            return;
+        };
+        self.paths = order
+            .iter()
+            .map(|i| self.lib.assets[*i].path.clone())
+            .collect();
+        self.names = self.paths.iter().map(|p| file_name(p)).collect();
+        self.title = match self.lib.scope {
+            Scope::Folder(f) => self.lib.folders[f].name.clone(),
+            Scope::Collection(c) => self
+                .lib
+                .collections
+                .get(c)
+                .map(|c| c.name.clone())
+                .unwrap_or_default(),
+        };
+        self.index = position;
+        self.current = Some(asset);
+        self.menu.close();
+        self.mode = Mode::Viewer;
+        self.load(Framing::Reset);
+        self.rewatch();
+        self.retitle();
+    }
+
+    /// Write a PNG next to each of a batch of assets, at thumbnail quality
+    /// but full size -- the library's "screenshot all".
+    fn screenshot_all(&mut self, assets: &[usize]) {
+        let paths: Vec<PathBuf> = assets
+            .iter()
+            .filter_map(|i| self.lib.assets.get(*i).map(|a| a.path.clone()))
+            .collect();
+        let mut written = 0;
+        for path in &paths {
+            match self.write_png(path) {
+                Ok(()) => written += 1,
+                Err(e) => eprintln!("voxview: {e:#}"),
+            }
+        }
+        self.status = Some((
+            format!("saved {written} of {} screenshots", paths.len()),
+            Instant::now(),
+        ));
+    }
+
+    /// One off-screen render, saved beside its model.
+    fn write_png(&mut self, path: &Path) -> Result<()> {
+        let scene = loader::load_file(path)?;
+        let meshes = mesh::mesh_models(&scene.models);
+        let renderer = self
+            .renderer
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no renderer yet"))?;
+        let pixels = renderer.thumbnail(&scene, &meshes, SHOT_SIZE)?;
+        let image = image::RgbaImage::from_raw(SHOT_SIZE, SHOT_SIZE, pixels)
+            .ok_or_else(|| anyhow::anyhow!("the render came back the wrong size"))?;
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "voxview".into());
+        let out = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .join(format!("{stem}_{}.png", timestamp()));
+        image
+            .save(&out)
+            .with_context(|| format!("could not write {}", out.display()))?;
+        println!("wrote {}", out.display());
+        Ok(())
+    }
+
+    /// Apply one thing the browser asked for.
+    fn act(&mut self, action: Action) {
+        match action {
+            Action::Open(asset) => self.open(asset),
+            Action::Screenshot(assets) => self.screenshot_all(&assets),
+            Action::ToLibrary => {
+                self.mode = Mode::Library;
+                self.retitle();
+            }
+            Action::Reload => self.load(Framing::Keep),
+            Action::Toggle(toggle) => match toggle {
+                Toggle::Grid => self.show_grid = !self.show_grid,
+                Toggle::Bbox => self.show_bbox = !self.show_bbox,
+                Toggle::Axes => self.show_axes = !self.show_axes,
+                Toggle::Occlusion => self.ambient_occlusion = !self.ambient_occlusion,
+                Toggle::Background => self.background = self.background.toggled(),
+            },
+        }
     }
 
     /// Read, mesh and upload the current file.
@@ -378,19 +585,10 @@ impl App {
             None => lines.push(HudLine::normal("no model loaded")),
         }
 
-        lines.push(HudLine::dim(format!(
-            "[G]rid {}  [B]ox {}  [A]xes {}  [O]cclusion {}",
-            on_off(self.show_grid),
-            on_off(self.show_bbox),
-            on_off(self.show_axes),
-            on_off(self.ambient_occlusion),
-        )));
-        if self.paths.len() > 1 {
-            lines.push(HudLine::dim(format!(
-                "file {} of {}  [ ]  [M]enu",
-                self.index + 1,
-                self.paths.len()
-            )));
+        // The overlay switches and the file counter live in the egui chrome
+        // now, so the text HUD stops repeating them.
+        if self.paths.len() < 2 {
+            lines.push(HudLine::dim("[M]enu  [Esc] library"));
         }
         if let Some(error) = &self.error {
             lines.push(HudLine::error(format!("error: {error}")));
@@ -404,17 +602,24 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        self.drain_scan();
         if self.watcher.as_mut().is_some_and(FileWatcher::poll) {
             self.load(Framing::Keep);
+            // The file on disk changed, so its cached picture is wrong.
+            if let (Some(ui), Some(asset)) = (&mut self.ui, self.current) {
+                let path = self.lib.assets[asset].path.clone();
+                ui.thumbs.forget(&path);
+            }
         }
         self.fps.tick();
 
-        let hud = self.hud();
+        let viewing = self.mode == Mode::Viewer;
+        let hud = if viewing { self.hud() } else { Vec::new() };
         let scale = self
             .window
             .as_ref()
             .map_or(1.0, |w| w.scale_factor().round().max(1.0) as f32);
-        let menu = if self.menu.is_open() {
+        let menu = if viewing && self.menu.is_open() {
             let (w, h) = self.renderer.as_ref().map_or((1280, 800), Renderer::size);
             self.menu.lines(
                 &self.names,
@@ -426,6 +631,39 @@ impl App {
         } else {
             Vec::new()
         };
+        // egui draws before the scene is submitted, because building a
+        // thumbnail needs the device and must not land inside a render pass.
+        let ui_frame = match (self.ui.take(), self.window.clone(), self.renderer.as_mut()) {
+            (Some(mut ui), Some(window), Some(renderer)) => {
+                let chrome = if viewing {
+                    Chrome::Viewer(ViewerChrome {
+                        current: self.current,
+                        show_grid: self.show_grid,
+                        show_bbox: self.show_bbox,
+                        show_axes: self.show_axes,
+                        occlusion: self.ambient_occlusion,
+                        error: self.error.as_deref(),
+                    })
+                } else {
+                    Chrome::Library(ScanStatus {
+                        found: self.found,
+                        parsed: self.parsed,
+                        scanning: self.scan.as_ref().is_some_and(|s| !s.finished()),
+                    })
+                };
+                let (frame, actions) = ui.frame(&window, renderer, &mut self.lib, chrome);
+                self.ui = Some(ui);
+                for action in actions {
+                    self.act(action);
+                }
+                Some(frame)
+            }
+            (ui, _, _) => {
+                self.ui = ui;
+                None
+            }
+        };
+
         let params = FrameParams {
             camera: &self.camera,
             show_grid: self.show_grid,
@@ -436,16 +674,107 @@ impl App {
             hud: &hud,
             menu: &menu,
             hud_scale: scale,
-            draw_scene: true,
+            draw_scene: viewing,
         };
         if let Some(renderer) = &mut self.renderer {
-            renderer.render(&params, None);
+            renderer.render(&params, ui_frame);
+        }
+    }
+
+    /// Keys while the grid is up. The viewer's own bindings are left alone.
+    fn library_key(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
+        let columns = self.ui.as_ref().map_or(1, Ui::columns) as isize;
+        let step = match code {
+            KeyCode::ArrowLeft => Some(-1),
+            KeyCode::ArrowRight => Some(1),
+            KeyCode::ArrowUp => Some(-columns),
+            KeyCode::ArrowDown => Some(columns),
+            KeyCode::Home => Some(isize::MIN / 2),
+            KeyCode::End => Some(isize::MAX / 2),
+            _ => None,
+        };
+        if let Some(step) = step {
+            if let Some(row) = self.lib.move_cursor(step)
+                && let Some(ui) = &mut self.ui
+            {
+                ui.scroll_to_row(row);
+            }
+            return;
+        }
+
+        match code {
+            KeyCode::Escape => {
+                // Escape undoes the last thing you did: an overlay, then the
+                // filters, then the program.
+                let overlay = self.ui.as_mut().is_some_and(Ui::close_overlay);
+                if overlay {
+                } else if self.lib.facets.any() || !self.lib.find.is_empty() {
+                    self.lib.clear_filters();
+                } else {
+                    event_loop.exit();
+                }
+            }
+            KeyCode::KeyQ => event_loop.exit(),
+            KeyCode::Slash => {
+                if let Some(ui) = &mut self.ui {
+                    ui.focus_find();
+                }
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                if let Some(asset) = self.lib.focused() {
+                    self.open(asset);
+                }
+            }
+            KeyCode::Space => {
+                if let Some(ui) = &mut self.ui {
+                    ui.toggle_peek();
+                }
+            }
+            KeyCode::KeyC => {
+                if let Some(ui) = &mut self.ui {
+                    ui.prompt_collection();
+                }
+            }
+            KeyCode::KeyV => {
+                self.lib.view = match self.lib.view {
+                    View::Grid => View::List,
+                    View::List => View::Grid,
+                };
+            }
+            KeyCode::KeyS => {
+                self.lib.stack_variants = !self.lib.stack_variants;
+                self.lib.invalidate();
+            }
+            KeyCode::KeyA if self.ctrl => self.lib.select_all(),
+            KeyCode::KeyP => {
+                let assets = if self.lib.selection.is_empty() {
+                    self.lib.focused().into_iter().collect()
+                } else {
+                    self.lib.selection.clone()
+                };
+                self.screenshot_all(&assets);
+            }
+            KeyCode::BracketLeft | KeyCode::BracketRight => {
+                let delta = if code == KeyCode::BracketLeft { -1 } else { 1 };
+                if let Some(row) = self.lib.move_cursor(delta)
+                    && let Some(ui) = &mut self.ui
+                {
+                    ui.scroll_to_row(row);
+                }
+            }
+            _ => {}
         }
     }
 
     fn key(&mut self, code: KeyCode, event_loop: &ActiveEventLoop) {
         match code {
-            KeyCode::Escape | KeyCode::KeyQ => event_loop.exit(),
+            // Escape steps back to the grid; only Q leaves outright.
+            KeyCode::Escape => {
+                self.sync_current();
+                self.mode = Mode::Library;
+                self.retitle();
+            }
+            KeyCode::KeyQ => event_loop.exit(),
             KeyCode::KeyF => {
                 if let Some(bounds) = self.renderer.as_ref().and_then(Renderer::bounds) {
                     self.camera.frame(&bounds);
@@ -502,12 +831,44 @@ impl ApplicationHandler for App {
                 return;
             }
         }
+        self.ui = Some(Ui::new(&window));
         self.window = Some(window);
+        self.scan = Some(Scan::start(self.root.clone()));
         self.load(Framing::Reset);
         self.rewatch();
+        self.retitle();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // egui sees every event first. In the library it owns the window
+        // outright; in the viewer it claims only what the chrome is under,
+        // so an orbit started on bare background still works.
+        let consumed = match (self.ui.take(), self.window.clone()) {
+            (Some(mut ui), Some(window)) => {
+                let consumed = ui.on_event(&window, &event);
+                self.ui = Some(ui);
+                consumed
+            }
+            (ui, _) => {
+                self.ui = ui;
+                false
+            }
+        };
+        let browsing = self.mode == Mode::Library;
+        // A redraw and a resize are the window's business whoever consumed
+        // them, and a close request always closes.
+        let plumbing = matches!(
+            event,
+            WindowEvent::CloseRequested
+                | WindowEvent::Resized(_)
+                | WindowEvent::RedrawRequested
+                | WindowEvent::ModifiersChanged(_)
+                | WindowEvent::ScaleFactorChanged { .. }
+        );
+        if consumed && !plumbing {
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -517,6 +878,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed || event.repeat {
+                    return;
+                }
+                // While a text field has the keyboard, single letters are
+                // letters, not shortcuts.
+                if self.ui.as_ref().is_some_and(Ui::typing) {
                     return;
                 }
                 let code = match event.physical_key {
@@ -536,10 +902,19 @@ impl ApplicationHandler for App {
                     }
                 }
                 if let Some(code) = code {
-                    self.key(code, event_loop);
+                    if browsing {
+                        self.library_key(code, event_loop);
+                    } else {
+                        self.key(code, event_loop);
+                    }
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
+            WindowEvent::ModifiersChanged(modifiers) => {
+                let state = modifiers.state();
+                self.shift = state.shift_key();
+                self.ctrl = state.control_key() || state.super_key();
+            }
+            WindowEvent::MouseInput { state, button, .. } if !browsing => {
                 let down = state == ElementState::Pressed;
                 // A press inside the menu picks a file; it must not also start
                 // an orbit, so it is swallowed here and never reaches `Mouse`.
@@ -562,7 +937,7 @@ impl ApplicationHandler for App {
                     self.mouse.last = None;
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
+            WindowEvent::CursorMoved { position, .. } if !browsing => {
                 self.mouse.position = position;
                 let last = self.mouse.last.replace(position);
                 if !self.mouse.left && !self.mouse.pan {
@@ -578,7 +953,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorLeft { .. } => self.mouse.last = None,
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !browsing => {
                 let notches = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     // Touchpads report pixels; 50 of them feels like one notch.
@@ -627,10 +1002,6 @@ fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
-}
-
-fn on_off(b: bool) -> &'static str {
-    if b { "on" } else { "off" }
 }
 
 fn first_line(s: &str) -> String {

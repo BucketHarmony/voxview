@@ -45,7 +45,10 @@ fn run() -> Result<()> {
         print_stats(&paths[index], &scene);
         return Ok(());
     }
-    voxview::app::run(paths, index)
+    // A directory argument means "show me what is here", so it opens the
+    // library; naming one file means "show me this", so it opens the viewer.
+    let browse = path.is_dir();
+    voxview::app::run(loader::browse_root(path), paths, index, browse)
 }
 
 fn print_stats(path: &std::path::Path, scene: &loader::VoxScene) {

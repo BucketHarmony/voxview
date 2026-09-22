@@ -775,6 +775,20 @@ impl Library {
         self.selection.last().copied()
     }
 
+    /// The folder worth naming beside an asset, or `None` when everything on
+    /// screen shares one.
+    ///
+    /// Veloren names a whole family of sprites `0.vox` .. `6.vox` inside a
+    /// folder called `crate`, so browsing a subtree without this shows a grid
+    /// of cells labelled `0`, `1`, `1`, `1`.
+    pub fn folder_hint(&self, asset: usize) -> Option<&str> {
+        let folder = self.assets[asset].folder;
+        match self.scope {
+            Scope::Folder(scope) if scope == folder => None,
+            _ => Some(&self.folders[folder].name),
+        }
+    }
+
     pub fn is_selected(&self, asset: usize) -> bool {
         self.selection.contains(&asset)
     }
@@ -816,6 +830,35 @@ impl Library {
             self.selection.push(asset);
         }
         self.anchor = Some(asset);
+    }
+
+    /// Move the keyboard cursor `delta` rows and select what it lands on.
+    ///
+    /// Clamped rather than wrapped: arrowing off the end of a folder should
+    /// stop there, not jump you back to the top of a list you just left.
+    pub fn move_cursor(&mut self, delta: isize) -> Option<usize> {
+        let len = self.rows().len();
+        if len == 0 {
+            self.cursor = 0;
+            return None;
+        }
+        let next = (self.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+        self.cursor = next;
+        let asset = self.rows()[next].lead();
+        self.select_only(asset);
+        Some(next)
+    }
+
+    /// Put the cursor on the row holding `asset`, so the keyboard picks up
+    /// where the mouse left off.
+    pub fn focus_row(&mut self, asset: usize) {
+        let found = self.rows().iter().position(|row| match row {
+            Row::One(a) => *a == asset,
+            Row::Family { members, .. } => members.contains(&asset),
+        });
+        if let Some(row) = found {
+            self.cursor = row;
+        }
     }
 
     pub fn select_only(&mut self, asset: usize) {
