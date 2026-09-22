@@ -20,4 +20,5 @@ pub mod palette;
 pub mod scan;
 pub mod scene;
 pub mod thumb;
+pub mod ui;
 pub mod watch;
