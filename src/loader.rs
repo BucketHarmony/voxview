@@ -18,6 +18,9 @@ pub struct VoxScene {
     /// One entry per visible placement of a model.
     pub instances: Vec<ModelInstance>,
     pub palette: Palette,
+    /// False when the file carried no `RGBA` chunk and the MagicaVoxel
+    /// default was substituted. The library's palette facet reports it.
+    pub palette_from_file: bool,
     /// Number of `MATL` chunks; read but not rendered in v1.
     pub material_count: usize,
     /// Total occupied cells across every *instanced* model.
@@ -63,10 +66,11 @@ pub fn load_bytes(bytes: &[u8]) -> Result<VoxScene> {
         models.push(grid);
     }
 
-    let palette = if parsed.palette.is_empty() {
-        Palette::magicavoxel_default()
-    } else {
+    let palette_from_file = !parsed.palette.is_empty();
+    let palette = if palette_from_file {
         Palette::from_file_colors(&parsed.palette)
+    } else {
+        Palette::magicavoxel_default()
     };
 
     let hidden_layers: Vec<bool> = parsed.layers.iter().map(|l| l.hidden()).collect();
@@ -90,6 +94,7 @@ pub fn load_bytes(bytes: &[u8]) -> Result<VoxScene> {
         models,
         instances,
         palette,
+        palette_from_file,
         material_count: parsed.materials.len(),
         voxel_count,
         bounds: bounds.unwrap_or_default(),
