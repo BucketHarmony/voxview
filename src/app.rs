@@ -321,6 +321,7 @@ impl App {
             hud: &[],
             menu: &[],
             hud_scale: 1.0,
+            draw_scene: true,
         };
         let result = self
             .renderer
@@ -435,9 +436,10 @@ impl App {
             hud: &hud,
             menu: &menu,
             hud_scale: scale,
+            draw_scene: true,
         };
         if let Some(renderer) = &mut self.renderer {
-            renderer.render(&params);
+            renderer.render(&params, None);
         }
     }
 

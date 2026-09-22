@@ -72,6 +72,15 @@ pub struct FrameParams<'a> {
     pub menu: &'a [HudLine],
     /// Integer pixel scale for HUD text.
     pub hud_scale: f32,
+    /// False in the library, where egui owns the whole window.
+    pub draw_scene: bool,
+}
+
+/// One frame's worth of egui output, handed straight to `egui-wgpu`.
+pub struct UiFrame {
+    pub jobs: Vec<egui::ClippedPrimitive>,
+    pub textures: egui::TexturesDelta,
+    pub pixels_per_point: f32,
 }
 
 #[repr(C)]
@@ -178,6 +187,12 @@ pub struct Renderer {
 
     scene: Option<GpuScene>,
     overlays: Option<GpuOverlays>,
+    /// The viewer's palette, kept so a thumbnail render can borrow the shared
+    /// palette buffer and hand it back untouched.
+    palette_linear: [[f32; 4]; 256],
+    /// Depth attachment for off-screen thumbnails, sized on first use.
+    thumb_depth: Option<(u32, wgpu::TextureView)>,
+    egui: egui_wgpu::Renderer,
     hud_vertices: GrowBuffer,
     hud_indices: GrowBuffer,
     hud_index_count: u32,
@@ -323,6 +338,19 @@ impl Renderer {
 
         let model_stride = device.limits().min_uniform_buffer_offset_alignment.max(64);
 
+        let egui = egui_wgpu::Renderer::new(
+            &device,
+            format,
+            egui_wgpu::RendererOptions {
+                // egui draws over the finished 3D frame in its own pass and
+                // never needs depth; MSAA is off for the same reason the
+                // voxel pipeline does without it.
+                msaa_samples: 1,
+                depth_stencil_format: None,
+                ..Default::default()
+            },
+        );
+
         let hud_vertices = GrowBuffer::new(&device, "hud vertices", wgpu::BufferUsages::VERTEX);
         let hud_indices = GrowBuffer::new(&device, "hud indices", wgpu::BufferUsages::INDEX);
 
@@ -342,6 +370,9 @@ impl Renderer {
             hud_pipeline,
             scene: None,
             overlays: None,
+            palette_linear: [[0.0; 4]; 256],
+            thumb_depth: None,
+            egui,
             hud_vertices,
             hud_indices,
             hud_index_count: 0,
@@ -381,12 +412,28 @@ impl Renderer {
     /// Replace the geometry on the GPU. Leaves the camera alone -- hot reload
     /// depends on that.
     pub fn set_scene(&mut self, scene: &VoxScene, meshes: &[Mesh]) {
+        self.palette_linear = scene.palette.to_linear_rgba();
         self.queue.write_buffer(
             &self.palette_buffer,
             0,
-            bytemuck::cast_slice(&scene.palette.to_linear_rgba()),
+            bytemuck::cast_slice(&self.palette_linear),
         );
 
+        let ranges = overlay::build(&scene.bounds);
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("overlay lines"),
+                contents: non_empty(bytemuck::cast_slice(&ranges.vertices)),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.overlays = Some(GpuOverlays { buffer, ranges });
+        self.scene = Some(self.build_scene(scene, meshes));
+    }
+
+    /// Upload one scene's meshes and transforms. Touches nothing on `self`, so
+    /// thumbnails can build a throwaway scene without disturbing the viewer's.
+    fn build_scene(&self, scene: &VoxScene, meshes: &[Mesh]) -> GpuScene {
         let gpu_meshes: Vec<GpuMesh> = meshes
             .iter()
             .enumerate()
@@ -449,23 +496,13 @@ impl Renderer {
             }],
         });
 
-        let ranges = overlay::build(&scene.bounds);
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("overlay lines"),
-                contents: non_empty(bytemuck::cast_slice(&ranges.vertices)),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        self.overlays = Some(GpuOverlays { buffer, ranges });
-
-        self.scene = Some(GpuScene {
+        GpuScene {
             meshes: gpu_meshes,
             draws,
             model_bind_group,
             bounds: scene.bounds,
             triangle_count,
-        });
+        }
     }
 
     /// Draw one frame to the window.
@@ -473,7 +510,7 @@ impl Renderer {
     /// Surfaces go stale on their own -- a resize, a monitor change, a
     /// compositor restart -- so the recoverable cases are handled here rather
     /// than pushed onto the caller.
-    pub fn render(&mut self, params: &FrameParams) {
+    pub fn render(&mut self, params: &FrameParams, ui: Option<UiFrame>) {
         use wgpu::CurrentSurfaceTexture as Acquired;
         let frame = match self.surface.get_current_texture() {
             Acquired::Success(frame) => frame,
@@ -504,6 +541,9 @@ impl Renderer {
                 label: Some("frame"),
             });
         self.encode(&mut encoder, &view, params, true);
+        if let Some(ui) = ui {
+            self.encode_ui(&mut encoder, &view, ui);
+        }
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
     }
@@ -539,14 +579,38 @@ impl Renderer {
             hud: &[],
             menu: &[],
             hud_scale: params.hud_scale,
+            draw_scene: true,
         };
         self.prepare(&clean);
 
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("screenshot"),
+            });
+        self.encode(&mut encoder, &view, &clean, false);
+        self.queue.submit(Some(encoder.finish()));
+        let pixels = self.read_texture(&texture, width, height)?;
+
+        let image = image::RgbaImage::from_raw(width, height, pixels)
+            .ok_or_else(|| anyhow!("screenshot pixel data was the wrong length"))?;
+        image
+            .save(path)
+            .with_context(|| format!("could not write {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Copy a rendered texture back to RGBA8 bytes on the CPU.
+    ///
+    /// Shared by screenshots and by library thumbnails; both need the same
+    /// row padding and the same swizzle on backends that hand out a BGRA
+    /// swapchain format.
+    fn read_texture(&self, texture: &wgpu::Texture, width: u32, height: u32) -> Result<Vec<u8>> {
         // Copy destinations need rows padded to 256 bytes.
         let unpadded = width as usize * 4;
         let padded = unpadded.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("screenshot readback"),
+            label: Some("texture readback"),
             size: (padded * height as usize) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -555,12 +619,11 @@ impl Renderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("screenshot"),
+                label: Some("texture readback"),
             });
-        self.encode(&mut encoder, &view, &clean, false);
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &texture,
+                texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -590,14 +653,14 @@ impl Renderer {
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| anyhow!("waiting for the GPU failed: {e}"))?;
         rx.recv()
-            .map_err(|_| anyhow!("the screenshot readback was dropped"))?
-            .map_err(|e| anyhow!("could not read the screenshot back: {e}"))?;
+            .map_err(|_| anyhow!("the readback was dropped"))?
+            .map_err(|e| anyhow!("could not read the texture back: {e}"))?;
 
         let mut pixels = Vec::with_capacity(unpadded * height as usize);
         {
             let data = slice
                 .get_mapped_range()
-                .map_err(|e| anyhow!("could not map the screenshot buffer: {e}"))?;
+                .map_err(|e| anyhow!("could not map the readback buffer: {e}"))?;
             let swap_rb = matches!(
                 self.config.format,
                 wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
@@ -613,13 +676,161 @@ impl Renderer {
             }
         }
         readback.unmap();
+        Ok(pixels)
+    }
 
-        let image = image::RgbaImage::from_raw(width, height, pixels)
-            .ok_or_else(|| anyhow!("screenshot pixel data was the wrong length"))?;
-        image
-            .save(path)
-            .with_context(|| format!("could not write {}", path.display()))?;
-        Ok(())
+    /// Render one model to a square RGBA thumbnail on a transparent ground.
+    ///
+    /// Always the same angle, so a folder of a hundred assets reads as one
+    /// set. The viewer's own scene is untouched: this builds a throwaway
+    /// `GpuScene`, borrows the shared palette and globals buffers, and puts
+    /// the palette back on the way out. `prepare` rewrites the globals at the
+    /// top of every frame, so those need no restoring.
+    pub fn thumbnail(&mut self, scene: &VoxScene, meshes: &[Mesh], size: u32) -> Result<Vec<u8>> {
+        let size = size.clamp(16, 512);
+        let gpu = self.build_scene(scene, meshes);
+
+        self.queue.write_buffer(
+            &self.palette_buffer,
+            0,
+            bytemuck::cast_slice(&scene.palette.to_linear_rgba()),
+        );
+
+        let mut camera = OrbitCamera::default();
+        camera.reset(&scene.bounds);
+        let globals = Globals {
+            view_proj: camera.view_projection(1.0).to_cols_array_2d(),
+            light_dir: LIGHT_DIR.normalize().extend(0.0).to_array(),
+            params: [AMBIENT, 1.0, 0.0, 0.0],
+            viewport: [size as f32, size as f32, 0.0, 0.0],
+        };
+        self.queue
+            .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
+
+        if self.thumb_depth.as_ref().is_none_or(|(s, _)| *s != size) {
+            self.thumb_depth = Some((size, create_depth(&self.device, size, size)));
+        }
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("thumbnail"),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("thumbnail"),
+            });
+        {
+            let depth = &self.thumb_depth.as_ref().expect("set just above").1;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("thumbnail"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.voxel_pipeline);
+            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            for draw in &gpu.draws {
+                let Some(mesh) = gpu.meshes.get(draw.mesh) else {
+                    continue;
+                };
+                if mesh.index_count == 0 {
+                    continue;
+                }
+                pass.set_bind_group(1, &gpu.model_bind_group, &[draw.uniform_offset]);
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
+        self.queue.submit(Some(encoder.finish()));
+
+        let pixels = self.read_texture(&texture, size, size);
+        self.queue.write_buffer(
+            &self.palette_buffer,
+            0,
+            bytemuck::cast_slice(&self.palette_linear),
+        );
+        pixels
+    }
+
+    /// Draw egui's tessellated output over whatever is already in the target.
+    fn encode_ui(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        ui: UiFrame,
+    ) {
+        let desc = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: ui.pixels_per_point,
+        };
+        for (id, deltas) in &ui.textures.set {
+            for delta in deltas {
+                self.egui
+                    .update_texture(&self.device, &self.queue, *id, delta);
+            }
+        }
+        // Any staging work egui needs has to land before the pass that reads it.
+        let staged = self
+            .egui
+            .update_buffers(&self.device, &self.queue, encoder, &ui.jobs, &desc);
+        if !staged.is_empty() {
+            self.queue.submit(staged);
+        }
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            self.egui.render(&mut pass, &ui.jobs, &desc);
+        }
+        for id in &ui.textures.free {
+            self.egui.free_texture(id);
+        }
     }
 
     /// Upload the per-frame uniforms and HUD geometry.
@@ -702,6 +913,10 @@ impl Renderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+
+        if !params.draw_scene {
+            return;
+        }
 
         if let Some(scene) = &self.scene {
             pass.set_pipeline(&self.voxel_pipeline);
