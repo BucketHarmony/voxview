@@ -203,6 +203,55 @@ Two extension points are marked in the source with `// EXTENSION:`: loading
 Veloren RON manifests, which describe multi-part assemblies with per-part
 offsets (`src/loader.rs`), and a palette remap tool (`src/palette.rs`).
 
+## Reading the source
+
+```sh
+cargo doc --no-deps --open
+```
+
+Every module carries a rustdoc header saying what it is for and, where it
+matters, why it is shaped the way it is. The short version:
+
+| Module | What lives there |
+| --- | --- |
+| `loader` | Reading bytes into a `Scene`: `dot_vox`, the walk over a directory, the `catch_unwind` guard |
+| `scene` | The `nTRN`/`nGRP`/`nSHP` graph, flattened into instances with transforms |
+| `model` | `VoxelGrid` — the dense occupancy grid a model becomes |
+| `mesh` | Greedy meshing and the per-face occlusion term |
+| `palette` | 256 colours, padded from MagicaVoxel's default, plus the remap extension point |
+| `gfx` | wgpu: pipelines, buffers, the render pass, off-screen thumbnails and screenshots |
+| `camera` | The orbit camera, framing and reset |
+| `overlay`, `hud`, `font` | Grid, bounding box, axes, and the bitmap-font HUD |
+| `library` | The asset model behind the browser: folders, families, facets, selection, sort |
+| `scan` | The background walk that feeds the library |
+| `thumb` | Thumbnail rendering and the on-disk cache |
+| `ui` | The egui layer — presentation only; clicks come back as an `Action` |
+| `watch`, `menu`, `app` | The file watcher, the text file menu, and the event loop that ties it together |
+| `fixtures` | The three test `.vox` files, written from code so no editor is needed |
+
+`NOTES.md` is the other half of the documentation, and the more useful half if
+you are about to touch the parser: it records what the `.vox` format and
+`dot_vox` do that the obvious reading does not predict.
+
 ## Licence
 
-MIT OR Apache-2.0.
+Dual licensed under either of
+
+* MIT (`LICENSE-MIT`)
+* Apache License 2.0 (`LICENSE-APACHE`)
+
+at your option. This is the Rust ecosystem's convention rather than a coin
+toss: MIT is the shortest permissive licence most people already accept, and
+Apache-2.0 adds an explicit patent grant and a clear contribution clause for
+anyone who needs those. Offering both means voxview can be vendored into
+almost anything without a licence-compatibility argument — including a Veloren
+tooling tree, which is GPL-3.0, since both options are one-way compatible with
+it.
+
+Every dependency in the tree is permissive, so nothing here forces the choice.
+The one obligation that survives into a distributed binary is the four fonts
+egui embeds, whose licences ask for their notices to travel along;
+`THIRD-PARTY.md` has the details and the way to opt out of them.
+
+Unless you state otherwise, any contribution you submit shall be dual licensed
+as above, with no additional terms.

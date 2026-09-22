@@ -2,8 +2,12 @@
 name = "voxview"
 version = "0.1.0"
 edition = "2024"
-description = "A standalone MagicaVoxel .vox viewer"
+description = "A standalone MagicaVoxel .vox viewer and asset browser"
+authors = ["Kenneth Raisor"]
 license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["magicavoxel", "vox", "voxel", "viewer", "wgpu"]
+categories = ["visualization", "graphics", "command-line-utilities"]
 
 [lib]
 name = "voxview"

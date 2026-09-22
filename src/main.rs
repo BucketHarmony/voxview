@@ -1,13 +1,19 @@
+//! The `voxview` binary: argument parsing, `--stats`, and the hand-off to
+//! [`voxview::app::run`].
+//!
+//! Everything else lives in the library half of the crate, which is where the
+//! documentation is.
+
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 use voxview::loader;
 
-/// A viewer for MagicaVoxel `.vox` files.
+/// A viewer and browser for MagicaVoxel `.vox` files.
 #[derive(Parser, Debug)]
 #[command(name = "voxview", version, about, long_about = None)]
 struct Args {
-    /// A `.vox` file, or a directory to page through with `[` and `]`.
+    /// A `.vox` file to view, or a directory to browse.
     path: Option<PathBuf>,
 
     /// Print a summary of the file and exit without opening a window.

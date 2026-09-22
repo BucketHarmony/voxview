@@ -117,11 +117,11 @@ fn instance_bounds(inst: &ModelInstance, size: IVec3) -> Bounds {
 ///
 /// Veloren's deepest asset path is six directories; 24 is far past anything
 /// real and stops a symlink loop the `is_symlink` check somehow missed.
-const MAX_WALK_DEPTH: usize = 24;
+pub const MAX_WALK_DEPTH: usize = 24;
 
 /// Ceiling on files returned by one walk. Veloren ships ~4,800; this is two
 /// orders of magnitude of headroom and still bounds memory on a stray root.
-const MAX_WALK_FILES: usize = 200_000;
+pub const MAX_WALK_FILES: usize = 200_000;
 
 /// The result of walking a directory tree for `.vox` files.
 #[derive(Clone, Debug, Default)]
