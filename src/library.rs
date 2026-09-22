@@ -1223,6 +1223,40 @@ mod tests {
     }
 
     #[test]
+    fn the_cursor_walks_the_filtered_order_and_stops_at_the_ends() {
+        let mut lib = lib(&["a/barrel.vox", "a/basket.vox", "b/wolf.vox"]);
+        lib.find = "ba".into();
+        lib.invalidate();
+        assert_eq!(lib.rows().len(), 2, "wolf is filtered out");
+
+        assert_eq!(lib.move_cursor(0), Some(0), "the cursor starts at the top");
+        assert_eq!(lib.move_cursor(1), Some(1));
+        assert_eq!(lib.move_cursor(1), Some(1), "clamped, not wrapped");
+        assert_eq!(lib.move_cursor(-50), Some(0), "clamped at the other end");
+        assert_eq!(
+            lib.selection.len(),
+            1,
+            "moving the cursor selects what it lands on"
+        );
+    }
+
+    #[test]
+    fn the_folder_hint_names_a_folder_only_when_it_is_not_the_one_in_view() {
+        // Veloren's sprite variants are all called `0.vox`, so a cell caption
+        // needs its folder unless the folder is already the subject.
+        let mut lib = lib(&["sprite/carrot/0.vox", "sprite/radish/0.vox"]);
+        assert_eq!(lib.folder_hint(0), Some("carrot"));
+
+        let carrot = lib
+            .folders
+            .iter()
+            .position(|f| f.name == "carrot")
+            .expect("carrot folder");
+        lib.set_scope(Scope::Folder(carrot));
+        assert_eq!(lib.folder_hint(0), None, "already browsing carrot");
+    }
+
+    #[test]
     fn collections_cut_across_folders() {
         let mut lib = lib(&["a/one.vox", "b/two.vox", "c/three.vox"]);
         let set = lib.new_collection("Tavern".into());

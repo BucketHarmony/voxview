@@ -1,9 +1,11 @@
 # voxview
 
-A standalone viewer for MagicaVoxel `.vox` files. It opens any file MagicaVoxel
-writes, renders it with the file's own palette, and reloads when the file
-changes on disk — which is the point: it is meant to sit on a second monitor
-while you edit assets or while a pipeline writes them.
+A standalone viewer and browser for MagicaVoxel `.vox` files. It opens any file
+MagicaVoxel writes, renders it with the file's own palette, and reloads when the
+file changes on disk — which is the point: it is meant to sit on a second
+monitor while you edit assets or while a pipeline writes them. Point it at a
+directory instead and it walks the whole tree, so a few thousand assets are one
+window rather than a few thousand file-open dialogs.
 
 Single crate, single binary. No game engine.
 
@@ -23,23 +25,71 @@ one, and `WGPU_POWER_PREF=low` to pick the integrated GPU on a laptop.
 ## Usage
 
 ```sh
-voxview model.vox            # open one file
-voxview assets/voxel/npc/    # open the first .vox in a directory, page with [ and ]
+voxview model.vox            # open one file in the viewer
+voxview assets/voxygen/      # browse the tree in the library
 voxview model.vox --stats    # print a summary and exit, no window
 voxview --write-fixtures dir # write the synthetic test fixtures and exit
 ```
 
-Naming a single file still lists its siblings, so `[` and `]` page through the
-rest of the directory from wherever you started, and `M` opens a menu over them.
-Directories of a few hundred files -- Veloren ships several -- are best browsed
-from the menu, where you can type part of a name to narrow the list.
+Naming a file means "show me this", so it opens the viewer. Naming a directory
+means "show me what is here", so it opens the library: a thumbnail grid over
+every `.vox` under that directory, however deep. `Enter` or a double-click move
+from one to the other, and `Esc` goes back.
 
-The open file is watched. Save from MagicaVoxel and the model re-parses and
-re-meshes in place, without moving the camera. If the new bytes do not parse,
-the last good render stays on screen and the error appears in the HUD and on
-stderr.
+The file on screen in the viewer is watched. Save from MagicaVoxel and the model
+re-parses and re-meshes in place, without moving the camera. If the new bytes do
+not parse, the last good render stays on screen and the error appears in the HUD
+and on stderr.
+
+## The library
+
+The scan runs on a background thread, so the window is up and usable while it
+counts; the title bar says how many files it has found and the status bar says
+when it is done. Thumbnails are rendered on the GPU, only for the cells you can
+actually see, and cached between runs under `%LOCALAPPDATA%\voxview\thumbnails`
+(Windows) or `~/.cache/voxview/thumbnails` (Linux, or `$XDG_CACHE_HOME`). The
+cache key includes the file's size and modification time, so an edited model
+re-renders on its own.
+
+Down the left is the folder tree with a count beside each folder, then
+collections, then the filter facets — extent, palette source, and state
+(changed in the last 24 hours, failed to parse). Filters compose; the counts
+beside them are live and show what would still match. Across the top is the
+breadcrumb, a find box that matches on the path, the grid/list switch and the
+cell-size slider. Down the right is the inspector for whatever is selected: its
+preview, dimensions, voxel and triangle counts, model count, palette swatches
+and file size, or a summary when several assets are selected.
+
+Veloren names whole families of sprites `0.vox` .. `6.vox` inside one folder, so
+two things follow from that. Cell captions carry the folder when it is not the
+one being browsed — `carrot/0`, not `0`. And **stack variants** (on by default)
+folds `name-1.vox`, `name-2.vox` and friends into one cell with a `×n` badge;
+click the badge to open the stack, or press `S` to stop folding.
+
+Collections cut across folders: select some assets, press `C`, name the
+collection. They live for the run only — v1 does not write them to disk.
 
 ## Keys
+
+### In the library
+
+| Key | Action |
+| --- | --- |
+| Arrows | Move the cursor; `Home`, `End` jump to the ends |
+| `[`, `]` | Move the cursor one cell |
+| Click | Select; `Ctrl`-click adds, `Shift`-click extends |
+| Double-click, `Enter` | Open the asset in the viewer |
+| Space | Peek: a large preview over the grid, without leaving it |
+| `/` | Jump to the find box |
+| `V` | Switch between the grid and the list |
+| `S` | Fold or unfold variant stacks |
+| `C` | Put the selection in a collection |
+| `Ctrl-A` | Select everything that matches the filters |
+| `P` | Save a 512×512 PNG beside each selected file |
+| `Esc` | Close the overlay, else clear the filters, else quit |
+| `Q` | Quit |
+
+### In the viewer
 
 | Key | Action |
 | --- | --- |
@@ -54,38 +104,28 @@ stderr.
 | `O` | Ambient occlusion |
 | `T` | Toggle the dark and light background |
 | `P` | Save a PNG next to the model |
-| `[`, `]` | Previous, next `.vox` in the directory |
-| `M`, `Tab` | Open and close the file menu |
+| `[`, `]` | Previous, next asset |
+| `M`, `Tab` | Open and close the text file menu |
 | `R` | Reload now |
-| `Esc`, `Q` | Quit |
+| `Esc` | Back to the library |
+| `Q` | Quit |
 
-### In the file menu
+`[` and `]` follow the library's filtered, sorted order rather than a raw
+directory listing, so filtering to "everything over 32 voxels that changed
+today" and then paging through it works the way you would expect. The filmstrip
+along the bottom of the viewer shows where you are in that order.
 
-| Key | Action |
-| --- | --- |
-| Up, Down | Move the cursor, loading each file as you pass it |
-| PgUp, PgDn | Jump a screenful |
-| Click a row | Load that file |
-| Scroll | Scroll the list, without loading anything |
-| any letter | Add it to the filter |
-| Backspace | Remove the last filter character |
-| Enter | Load the highlighted file and close |
-| `Esc` | Clear the filter, or close if there is none |
-| `Tab` | Close, leaving the current file on screen |
+`M` opens the older text-mode file menu over the current directory. It predates
+the library and is kept because it is quick: type part of a name to narrow it,
+arrow through it to preview each file, `Enter` to commit, `Esc` or `Tab` to
+close. While it is open the single-letter shortcuts belong to the filter, so `G`
+types a `g` rather than toggling the grid.
 
-The menu lists the directory, marks the file on screen with `>` and the cursor
-with a highlight bar, and shows how many entries are above and below the view.
-Arrowing through it previews each file; typing only moves the cursor, so you
-can narrow a long list down before committing to a load.
-
-While the menu is open the single-letter shortcuts above belong to the filter,
-so `G` types a `g` rather than toggling the grid, and `M` will not close the
-menu it opened -- `Esc` or `Tab` do that. `Home`, `F` and the mouse still work
-on the camera, and `Esc` closes the menu rather than quitting the viewer.
-
-`P` writes `<name>_<YYYYMMDD-HHMMSS>.png` beside the model, at window
-resolution, with a transparent background and without the HUD or the overlays —
-so it drops straight into a contact sheet or a wiki page.
+`P` in the viewer writes `<name>_<YYYYMMDD-HHMMSS>.png` beside the model, at
+window resolution, with a transparent background and without the HUD or the
+overlays — so it drops straight into a contact sheet or a wiki page. `P` in the
+library does the same for every selected asset at 512×512, which is how you get
+a sheet of a hundred sprites without opening any of them.
 
 Coordinates are right-handed with **Z up**, matching MagicaVoxel and Veloren:
 a model's up in the editor is its up here.
@@ -148,13 +188,16 @@ budget: a 126³ model in under 200 ms.
 
 Malformed input is covered by tests that truncate and corrupt a fixture at
 thousands of offsets. Bad files produce an error in the HUD and on stderr; they
-never crash the viewer.
+never crash the viewer. In the library a file that will not parse gets a warning
+marker on its cell and is counted in the status bar rather than stopping the
+scan.
 
 ## Not in v1
 
 No editing, painting, export to other formats, materials or emissives, and no
 animation. `MATL` chunks are parsed and counted in the HUD but do not affect
-shading; `rOBJ` and `rCAM` are parsed and ignored.
+shading; `rOBJ` and `rCAM` are parsed and ignored. Collections are not saved
+between runs.
 
 Two extension points are marked in the source with `// EXTENSION:`: loading
 Veloren RON manifests, which describe multi-part assemblies with per-part

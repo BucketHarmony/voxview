@@ -131,3 +131,60 @@ carries both a depth limit and a visiting set.
   with the model, so it has to declare the same depth format with
   `CompareFunction::Always` and no depth writes. `depth_stencil: None` is a
   validation error there, not a no-op.
+
+---
+
+## The browser, and egui 0.36
+
+* **egui 0.36 rearranged its panels.** `TopBottomPanel` and `SidePanel` are
+  gone; there is one `Panel` type built with `Panel::top(id)`, `Panel::left(id)`
+  and friends. More importantly the closure they hand you takes a `&mut Ui`
+  rather than a `&Context`, and so does `CentralPanel`; `Context::run` is now
+  `Context::run_ui`. `style_mut` became `all_styles_mut`,
+  `wants_keyboard_input` became `egui_wants_keyboard_input`, and
+  `is_pointer_over_area` became `is_pointer_over_egui`. Every tutorial and
+  answer on the web is written against the old shape and none of it compiles.
+
+* **egui's default font has no geometric shapes.** Ubuntu-Light carries no
+  Miscellaneous Symbols block, so the disclosure triangles, the hamburger, the
+  grid icon, the diamond and the warning sign all render as hollow boxes —
+  silently, because a missing glyph is not an error. The fix is either to ship a
+  font or to stop using the characters. `src/ui.rs` does the latter: carets, the
+  thumbnail placeholder and the failure marker are painted with `Painter::add`,
+  and the rest are words ("Grid", "List", "asc"). `≤`, `×` and `…` do render, so
+  the facet labels and the stack badge keep theirs.
+
+* **egui's clipboard and link features are deliberately off.** They pull in
+  `arboard` and `webbrowser`, which want X11 or Wayland clipboard plumbing and a
+  desktop opener; neither is worth a dependency for a viewer that copies nothing
+  and opens no URLs. `Cargo.toml` takes `default-features = false`.
+
+* **egui draws before the scene is submitted, not after.** Building the frame
+  can need the device — a thumbnail that has finished decoding is uploaded
+  during `Ui::frame` — and an upload inside an open render pass is a validation
+  error. So the frame is built first and the resulting meshes are handed to the
+  renderer, which draws the scene and then the UI in one pass.
+
+* **egui gets first refusal on input, with four exceptions.** `CloseRequested`,
+  `Resized`, `RedrawRequested` and `ModifiersChanged` are plumbing and are
+  always processed. Leaving `ModifiersChanged` out looks harmless and breaks
+  `Ctrl`-click and `Ctrl-A` the instant the pointer crosses a panel, because the
+  modifier state stops being updated while egui is claiming the events.
+
+* **Thumbnails are rendered only for visible cells.** The grid virtualises
+  through `ScrollArea::show_rows`, and the thumbnail queue is fed from the rows
+  that pass, so browsing 4,517 files renders about twenty thumbnails rather than
+  4,517. The cache on disk fills in as you scroll and makes the second visit
+  free.
+
+* **"Changed today" means "in the last 24 hours".** Calendar days need a
+  timezone database to get right, and `SystemTime` does not carry one. A rolling
+  24-hour window is what the facet actually computes, and for the job — spotting
+  what a pipeline just wrote — it is the more useful of the two anyway.
+
+* **Veloren names sprite variants by number.** A folder called `carrot` holds
+  `0.vox` through `6.vox`, and so do a few hundred other folders, so a grid
+  keyed on the file stem is a wall of cells labelled `0`. Captions carry the
+  folder when it differs from the one being browsed. The separate
+  `name-1.vox` / `name-2.vox` convention is handled by stacking instead, which
+  is what the `S` key toggles.
