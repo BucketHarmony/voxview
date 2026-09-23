@@ -11,6 +11,7 @@
 //! render has on any driver: how much of the frame the model covers, which
 //! palette colours appear in it, and where the ink sits.
 
+use std::sync::{Mutex, OnceLock};
 use voxview::{fixtures, gfx::Renderer, loader, mesh};
 
 const SIZE: u32 = 128;
@@ -131,20 +132,39 @@ impl Shot {
     }
 }
 
-/// A renderer, or `None` when this machine has no usable adapter.
+/// One graphics device for the whole file, handed to one test at a time.
 ///
-/// Developers without a working Vulkan or DX12 setup get a skip and a note.
-/// CI sets `VOXVIEW_REQUIRE_GPU`, which turns the skip into a failure, so the
-/// coverage cannot quietly evaporate on the one machine that matters.
-fn renderer() -> Option<Renderer> {
-    // One sample everywhere except the test that is about multisampling:
-    // these assertions are about geometry and palette, and an antialiased
-    // edge only blurs the thing being measured.
-    renderer_with(1)
+/// Every test used to build its own. That is fine on a desktop GPU and a coin
+/// flip on a CI box with a software adapter: nine devices being created and
+/// torn down at once took the Windows runner's driver down with an access
+/// violation, in a test binary whose whole subject is that bad input does not
+/// crash anything. One device and one lock removes the question, and the
+/// suite runs faster for it.
+static SHARED: OnceLock<Mutex<Option<Renderer>>> = OnceLock::new();
+
+/// The shared renderer at one sample per pixel.
+///
+/// `None` when this machine has no usable adapter: developers without a
+/// working Vulkan or DX12 setup get a skip and a note. CI sets
+/// `VOXVIEW_REQUIRE_GPU`, which turns the skip into a failure, so the coverage
+/// cannot quietly evaporate on the one machine that matters.
+///
+/// One sample except where a test says otherwise, because these assertions are
+/// about geometry and palette and an antialiased edge only blurs what is being
+/// measured.
+fn renderer() -> Option<Lease> {
+    let mut guard = SHARED
+        .get_or_init(|| Mutex::new(open_renderer()))
+        // A panicking test leaves the renderer perfectly usable; refusing to
+        // hand it out after one failure would turn one red test into eight.
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.as_mut()?.set_samples(1);
+    Some(Lease { guard })
 }
 
-fn renderer_with(samples: u32) -> Option<Renderer> {
-    match Renderer::headless(SIZE, SIZE, samples) {
+fn open_renderer() -> Option<Renderer> {
+    match Renderer::headless(SIZE, SIZE, 1) {
         Ok(renderer) => {
             eprintln!("rendering on: {}", renderer.adapter_name);
             Some(renderer)
@@ -156,6 +176,25 @@ fn renderer_with(samples: u32) -> Option<Renderer> {
             eprintln!("skipping: no graphics adapter ({e:#})");
             None
         }
+    }
+}
+
+/// The shared renderer, borrowed for as long as one test runs.
+struct Lease {
+    guard: std::sync::MutexGuard<'static, Option<Renderer>>,
+}
+
+impl std::ops::Deref for Lease {
+    type Target = Renderer;
+
+    fn deref(&self) -> &Renderer {
+        self.guard.as_ref().expect("a lease implies a renderer")
+    }
+}
+
+impl std::ops::DerefMut for Lease {
+    fn deref_mut(&mut self) -> &mut Renderer {
+        self.guard.as_mut().expect("a lease implies a renderer")
     }
 }
 
@@ -319,20 +358,18 @@ fn the_same_input_renders_the_same_bytes_twice() {
 
 #[test]
 fn multisampling_softens_the_edges_of_the_model() {
-    let Some(mut plain) = renderer_with(1) else {
+    let Some(mut renderer) = renderer() else {
         return;
     };
-    let Some(mut smooth) = renderer_with(4) else {
-        return;
-    };
-    if smooth.samples() == 1 {
+    let data = fixtures::single_cube();
+    let hard = shoot(&mut renderer, &data, "aliased");
+
+    let samples = renderer.set_samples(4);
+    if samples == 1 {
         eprintln!("skipping: this adapter does not do 4x multisampling");
         return;
     }
-
-    let data = fixtures::single_cube();
-    let hard = shoot(&mut plain, &data, "aliased");
-    let soft = shoot(&mut smooth, &data, "antialiased");
+    let soft = shoot(&mut renderer, &data, "antialiased");
 
     // The thumbnail renders on a transparent ground, so a pixel the edge only
     // partly covers comes back partly transparent -- and at one sample there
@@ -348,10 +385,7 @@ fn multisampling_softens_the_edges_of_the_model() {
             .count()
     };
     let (hard_edge, soft_edge) = (partial(&hard), partial(&soft));
-    eprintln!(
-        "edge pixels: {hard_edge} at 1x, {soft_edge} at {}x",
-        smooth.samples()
-    );
+    eprintln!("edge pixels: {hard_edge} at 1x, {soft_edge} at {samples}x");
     assert_eq!(
         hard_edge, 0,
         "one sample per pixel should leave no partly covered pixels"
