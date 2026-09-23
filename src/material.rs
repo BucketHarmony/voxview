@@ -188,6 +188,14 @@ fn read_material(m: &dot_vox::Material) -> Material {
     // `_alpha` reads as "how much light passes through", the opposite way
     // round from a compositing alpha, so it is subtracted rather than used.
     // Older files spell the same idea `_trans`.
+    //
+    // A `_media` material usually carries neither, describing itself by
+    // density (`_d`) instead, and comes out opaque here. That is deliberate.
+    // Density is what a path tracer integrates along a ray through the volume;
+    // greedy meshing leaves only the shell of that volume, so applying a thin
+    // cloud's density to one surface gives a 5%-opaque skin and a model that
+    // has all but vanished. An opaque cloud is wrong in a way you can see and
+    // reason about; an invisible one just looks like a bug.
     let opacity = match kind {
         "_glass" | "_media" => 1.0 - unit(m.opacity().or_else(|| m.transparency()), 0.0),
         _ => 1.0,
@@ -277,6 +285,25 @@ mod tests {
         assert_eq!(m.metal, 0.0, "an emissive surface is not a metal one");
         assert_eq!(m.opacity, 1.0, "an emissive surface is not glass");
         assert!(m.is_emissive());
+    }
+
+    #[test]
+    fn a_volume_described_only_by_density_stays_opaque() {
+        // Straight out of MagicaVoxel's own cloud sample: `_media` with a
+        // density and no alpha at all.
+        let table = Materials::from_dot_vox(&[material(
+            237,
+            &[
+                ("_type", "_media"),
+                ("_media", "1"),
+                ("_d", "0.04"),
+                ("_rough", "0.1"),
+            ],
+        )]);
+        let m = table.get(236);
+        assert_eq!(m.opacity, 1.0);
+        assert!(!m.is_transparent());
+        assert_eq!(table.transparent_count(), 0);
     }
 
     #[test]

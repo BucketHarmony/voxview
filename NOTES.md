@@ -124,6 +124,18 @@ the accessor `opacity()`, which does not help.
 `_trans` (`Material::transparency()`) is the same quantity under the physical
 name and is accepted as a fallback.
 
+## `_media` describes itself by density, not by alpha
+
+A cloud in MagicaVoxel is `_type: _media` with `_d` — density — and usually no
+`_alpha` at all. Density is a quantity a path tracer integrates along a ray
+through the volume, and a rasteriser has no volume to integrate through:
+greedy meshing keeps only the exposed shell, so a typical `_d` of 0.04 applied
+to that shell is a 4%-opaque skin and the model has effectively disappeared.
+
+So `_media` is drawn opaque unless it names an alpha. An opaque cloud is wrong
+in a way you can see and reason about; an invisible one reads as a bug in the
+viewer.
+
 ## Emission is `_emit × (_flux + 1)`
 
 `_flux` is an integer exposure step, not a multiplier, and a material with

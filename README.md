@@ -196,8 +196,11 @@ model looks like across a room survive:
   from `_rough`, tinted towards the surface's own colour the way a metal tints
   its reflections. Per fragment matters here: greedy meshing merges a flat wall
   into one enormous quad, and a highlight interpolated across that is a smear.
-* **`_glass`** and **`_media`** are drawn in a second, blended pass that tests
-  depth without writing it.
+* **`_glass`** is drawn in a second, blended pass that tests depth without
+  writing it. So is **`_media`**, when it names an alpha; a fog that describes
+  itself only by density comes out opaque, because greedy meshing leaves only
+  the shell of the volume a density is meant to be integrated through, and a
+  5%-opaque skin is not a cloud.
 
 MagicaVoxel is a path tracer and this is not, so the rest — index of refraction,
 scattering, subsurface density, `rOBJ` render settings — is parsed and ignored.
@@ -315,7 +318,8 @@ binary embeds for its window, and a seven-size `.ico` that `build.rs` stamps
 into `voxview.exe` — plus `make-icon.py`, which draws both. The script is the
 source; the images are checked in so that building needs nothing but Cargo.
 
-`NOTES.md` is the other half of the documentation, and the more useful half if
+`CHANGELOG.md` records what changed in each release. `NOTES.md` is the other
+half of the documentation, and the more useful half if
 you are about to touch the parser: it records what the `.vox` format and
 `dot_vox` do that the obvious reading does not predict.
 
