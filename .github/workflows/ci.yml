@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Formatting and lints do not vary by platform, so they run once.
+  lint:
+    name: fmt, clippy, doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the Linux windowing headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev libxkbcommon-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features
+      - name: Documentation builds without warnings
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the Linux windowing headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev libxkbcommon-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+      # The meshing budget -- a 126 cubed model in under 200 ms -- is only
+      # meaningful with optimisations on.
+      - run: cargo test --workspace --release
+
+  # Proof that the thing actually renders, not just that it compiles. Mesa's
+  # software Vulkan driver stands in for a GPU, so this runs on a CI box with
+  # no display and no graphics card.
+  render:
+    name: headless render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Mesa's software Vulkan driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev libxkbcommon-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev \
+            mesa-vulkan-drivers vulkan-tools libvulkan1
+          vulkaninfo --summary || true
+      - name: Render the fixtures off-screen and compare them
+        run: cargo test --release --test render -- --nocapture
+        env:
+          WGPU_BACKEND: vulkan
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          # Turn the developer-friendly skip into a hard failure here: a CI
+          # box that quietly stops rendering is worse than no CI.
+          VOXVIEW_REQUIRE_GPU: "1"
+      - name: Keep the renders when they disagree
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-mismatch
+          path: target/render-output/
+          if-no-files-found: ignore
+
+  # A build that is not run is a build that is broken on the day you need it.
+  package:
+    name: package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the Linux windowing headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev libxkbcommon-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev
+      - run: cargo build --release
+      - name: The binary runs and reports its version
+        run: |
+          cargo run --release -- --version
+          cargo run --release -- --write-fixtures "${{ runner.temp }}/fixtures"
+          cargo run --release -- --stats "${{ runner.temp }}/fixtures/cube.vox"

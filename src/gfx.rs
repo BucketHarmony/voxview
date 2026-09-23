@@ -169,7 +169,8 @@ struct GpuOverlays {
 }
 
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
+    /// `None` when there is nothing to present to -- an off-screen render.
+    surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -208,38 +209,13 @@ impl Renderer {
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            // PRIMARY is Vulkan, DX12 and Metal: Vulkan on Linux for both
-            // Wayland and X11, and DX12 or Vulkan on Windows.
-            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
+        let instance = create_instance();
         let surface = instance
             .create_surface(window)
             .context("could not create a rendering surface for the window")?;
-
-        let adapter =
-            pollster::block_on(
-                instance.request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::from_env()
-                        .unwrap_or(wgpu::PowerPreference::HighPerformance),
-                    compatible_surface: Some(&surface),
-                    force_fallback_adapter: false,
-                    ..Default::default()
-                }),
-            )
+        let adapter = request_adapter(&instance, Some(&surface))
             .context("no graphics adapter could drive this window")?;
-        let adapter_name = adapter.get_info().name;
-
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("voxview device"),
-            required_features: wgpu::Features::empty(),
-            // Ask for exactly what this adapter offers: nothing here needs more
-            // than the downlevel defaults, which integrated GPUs all satisfy.
-            required_limits: adapter.limits(),
-            ..Default::default()
-        }))
-        .context("could not open a graphics device")?;
+        let (device, queue) = request_device(&adapter)?;
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -262,6 +238,48 @@ impl Renderer {
             view_formats: vec![],
         };
         surface.configure(&device, &config);
+        Renderer::build(Some(surface), &adapter, device, queue, config)
+    }
+
+    /// The same device and pipelines with nothing to present to.
+    ///
+    /// This is what `--render` and the headless tests use. It asks for a
+    /// fallback adapter if no real one answers, so it comes up on a CI box
+    /// with no display and no graphics card at all -- which is the point:
+    /// the render path gets exercised on every push, not only on a desktop.
+    pub fn headless(width: u32, height: u32) -> Result<Renderer> {
+        let (width, height) = (width.max(1), height.max(1));
+        let instance = create_instance();
+        let adapter = request_adapter(&instance, None)
+            .context("no graphics adapter is available for an off-screen render")?;
+        let (device, queue) = request_device(&adapter)?;
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // With no surface there is nothing to negotiate a format with, so
+            // take the one every backend can render to.
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+        };
+        Renderer::build(None, &adapter, device, queue, config)
+    }
+
+    /// Everything the windowed and off-screen paths have in common.
+    fn build(
+        surface: Option<wgpu::Surface<'static>>,
+        adapter: &wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        config: wgpu::SurfaceConfiguration,
+    ) -> Result<Renderer> {
+        let adapter_name = adapter.get_info().name;
+        let format = config.format;
+        let (width, height) = (config.width, config.height);
         let depth_view = create_depth(&device, width, height);
 
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -395,13 +413,17 @@ impl Renderer {
         }
         self.config.width = width;
         self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
         self.depth_view = create_depth(&self.device, width, height);
     }
 
     /// Reconfigure after a surface error; cheap enough to do on the spot.
     pub fn reconfigure(&mut self) {
-        self.surface.configure(&self.device, &self.config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
     }
 
     /// Triangles currently uploaded, for the HUD.
@@ -512,7 +534,10 @@ impl Renderer {
     /// than pushed onto the caller.
     pub fn render(&mut self, params: &FrameParams, ui: Option<UiFrame>) {
         use wgpu::CurrentSurfaceTexture as Acquired;
-        let frame = match self.surface.get_current_texture() {
+        let Some(surface) = &self.surface else {
+            return;
+        };
+        let frame = match surface.get_current_texture() {
             Acquired::Success(frame) => frame,
             // Still drawable this frame; reconfigure so the next one is clean.
             Acquired::Suboptimal(frame) => {
@@ -1076,6 +1101,56 @@ fn create_font(
             },
         ],
     })
+}
+
+/// PRIMARY is Vulkan, DX12 and Metal: Vulkan on Linux for both Wayland and
+/// X11, and DX12 or Vulkan on Windows.
+fn create_instance() -> wgpu::Instance {
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    })
+}
+
+/// Ask for a real adapter, then settle for a software one.
+///
+/// The fallback matters off-screen and nowhere else: a windowed session that
+/// lands on a software rasteriser would be miserable, but a thumbnail or a CI
+/// render only has to be correct.
+fn request_adapter(
+    instance: &wgpu::Instance,
+    surface: Option<&wgpu::Surface<'static>>,
+) -> Option<wgpu::Adapter> {
+    let options = wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::from_env()
+            .unwrap_or(wgpu::PowerPreference::HighPerformance),
+        compatible_surface: surface,
+        force_fallback_adapter: false,
+        ..Default::default()
+    };
+    if let Ok(adapter) = pollster::block_on(instance.request_adapter(&options)) {
+        return Some(adapter);
+    }
+    if surface.is_some() {
+        return None;
+    }
+    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        force_fallback_adapter: true,
+        ..options
+    }))
+    .ok()
+}
+
+fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue)> {
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("voxview device"),
+        required_features: wgpu::Features::empty(),
+        // Ask for exactly what this adapter offers: nothing here needs more
+        // than the downlevel defaults, which integrated GPUs all satisfy.
+        required_limits: adapter.limits(),
+        ..Default::default()
+    }))
+    .context("could not open a graphics device")
 }
 
 fn depth_state(write: bool, compare: wgpu::CompareFunction) -> Option<wgpu::DepthStencilState> {
