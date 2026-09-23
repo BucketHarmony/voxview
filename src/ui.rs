@@ -63,6 +63,7 @@ pub enum Toggle {
     Bbox,
     Axes,
     Occlusion,
+    Orthographic,
     Background,
 }
 
@@ -84,6 +85,7 @@ pub struct ViewerChrome<'a> {
     pub show_bbox: bool,
     pub show_axes: bool,
     pub occlusion: bool,
+    pub orthographic: bool,
     pub error: Option<&'a str>,
 }
 
@@ -1461,6 +1463,7 @@ impl Ui {
                         ("Box  B", chrome.show_bbox, Toggle::Bbox),
                         ("Axes  A", chrome.show_axes, Toggle::Axes),
                         ("AO  O", chrome.occlusion, Toggle::Occlusion),
+                        ("Ortho  5", chrome.orthographic, Toggle::Orthographic),
                     ];
                     for (label, on, toggle) in pills {
                         if ui.selectable_label(on, label).clicked() {

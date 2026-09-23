@@ -1,6 +1,6 @@
 //! The window, the input handling and the frame loop.
 
-use crate::camera::OrbitCamera;
+use crate::camera::{Axis, OrbitCamera};
 use crate::gfx::{Background, FrameParams, Renderer};
 use crate::hud::HudLine;
 use crate::library::{Library, Scope, View};
@@ -238,7 +238,7 @@ impl App {
             window: None,
             renderer: None,
             watcher: None,
-            camera: OrbitCamera::default(),
+            camera: OrbitCamera::with_projection(settings.orthographic),
             info: None,
             error: None,
             show_grid: settings.grid,
@@ -286,6 +286,7 @@ impl App {
         self.settings.bbox = self.show_bbox;
         self.settings.axes = self.show_axes;
         self.settings.occlusion = self.ambient_occlusion;
+        self.settings.orthographic = self.camera.orthographic;
         self.settings.view = self.lib.view;
         self.settings.sort = self.lib.sort;
         self.settings.descending = self.lib.descending;
@@ -527,6 +528,7 @@ impl App {
                 Toggle::Bbox => self.show_bbox = !self.show_bbox,
                 Toggle::Axes => self.show_axes = !self.show_axes,
                 Toggle::Occlusion => self.ambient_occlusion = !self.ambient_occlusion,
+                Toggle::Orthographic => self.camera.orthographic = !self.camera.orthographic,
                 Toggle::Background => self.background = self.background.toggled(),
             },
         }
@@ -720,6 +722,11 @@ impl App {
                     "{:.0} fps, load {:.0} ms, mesh {:.0} ms",
                     self.fps.value, info.load_ms, info.mesh_ms
                 )));
+                if self.camera.orthographic {
+                    // Only when it is on: perspective is the default, and a
+                    // HUD line that is always there teaches nobody anything.
+                    lines.push(HudLine::dim("orthographic"));
+                }
                 if info.default_palette {
                     lines.push(HudLine::dim("default palette (none in file)"));
                 }
@@ -785,6 +792,7 @@ impl App {
                         show_bbox: self.show_bbox,
                         show_axes: self.show_axes,
                         occlusion: self.ambient_occlusion,
+                        orthographic: self.camera.orthographic,
                         error: self.error.as_deref(),
                     })
                 } else {
@@ -940,8 +948,34 @@ impl App {
             KeyCode::KeyR => {
                 self.load(Framing::Keep);
             }
+            // Blender's numpad views, on the numpad and on the digit row for
+            // the laptops that have no numpad. Ctrl gives the opposite side,
+            // which is the convention people already have in their fingers.
+            KeyCode::Digit1 | KeyCode::Numpad1 => self.look_along(Axis::Front, Axis::Back),
+            KeyCode::Digit3 | KeyCode::Numpad3 => self.look_along(Axis::Right, Axis::Left),
+            KeyCode::Digit7 | KeyCode::Numpad7 => self.look_along(Axis::Top, Axis::Bottom),
+            KeyCode::Digit5 | KeyCode::Numpad5 => {
+                self.camera.orthographic = !self.camera.orthographic;
+                self.note(if self.camera.orthographic {
+                    "orthographic"
+                } else {
+                    "perspective"
+                });
+            }
             _ => {}
         }
+    }
+
+    /// Swing to `axis`, or to `opposite` when Ctrl is down.
+    fn look_along(&mut self, axis: Axis, opposite: Axis) {
+        let axis = if self.ctrl { opposite } else { axis };
+        self.camera.look_along(axis);
+        self.note(format!("{axis:?} view").to_lowercase());
+    }
+
+    /// Put a line in the HUD for a few seconds.
+    fn note(&mut self, text: impl Into<String>) {
+        self.status = Some((text.into(), Instant::now()));
     }
 }
 
