@@ -529,6 +529,7 @@ impl App {
                 Toggle::Axes => self.show_axes = !self.show_axes,
                 Toggle::Occlusion => self.ambient_occlusion = !self.ambient_occlusion,
                 Toggle::Orthographic => self.camera.orthographic = !self.camera.orthographic,
+                Toggle::Msaa => self.cycle_msaa(),
                 Toggle::Background => self.background = self.background.toggled(),
             },
         }
@@ -793,6 +794,7 @@ impl App {
                         show_axes: self.show_axes,
                         occlusion: self.ambient_occlusion,
                         orthographic: self.camera.orthographic,
+                        samples: renderer.samples(),
                         error: self.error.as_deref(),
                     })
                 } else {
@@ -940,6 +942,7 @@ impl App {
             KeyCode::KeyB => self.show_bbox = !self.show_bbox,
             KeyCode::KeyA => self.show_axes = !self.show_axes,
             KeyCode::KeyO => self.ambient_occlusion = !self.ambient_occlusion,
+            KeyCode::KeyS => self.cycle_msaa(),
             KeyCode::KeyT => self.background = self.background.toggled(),
             KeyCode::KeyP => self.screenshot(),
             KeyCode::KeyM | KeyCode::Tab => self.menu.toggle(&self.names, self.index),
@@ -974,6 +977,28 @@ impl App {
     }
 
     /// Put a line in the HUD for a few seconds.
+    /// Step to the next multisample count this adapter will give us.
+    ///
+    /// A cycle rather than an on/off switch: the useful question on a laptop
+    /// is not whether to antialias but how much to pay for it, and the answer
+    /// is visible in the frame rate in the corner while you press the key.
+    fn cycle_msaa(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let counts = renderer.supported_samples().to_vec();
+        let next = counts
+            .iter()
+            .position(|&n| n == renderer.samples())
+            .map_or(0, |i| (i + 1) % counts.len());
+        let samples = renderer.set_samples(counts[next]);
+        self.settings.msaa = samples;
+        self.note(match samples {
+            1 => "no antialiasing".to_owned(),
+            n => format!("{n}x antialiasing"),
+        });
+    }
+
     fn note(&mut self, text: impl Into<String>) {
         self.status = Some((text.into(), Instant::now()));
     }
@@ -1002,9 +1027,13 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        match Renderer::new(window.clone()) {
+        match Renderer::new(window.clone(), self.settings.msaa) {
             Ok(renderer) => {
                 println!("voxview: rendering on {}", renderer.adapter_name);
+                // The adapter may not do the count the settings asked for, so
+                // the settings take what it gave rather than asking again
+                // every launch.
+                self.settings.msaa = renderer.samples();
                 self.renderer = Some(renderer);
             }
             Err(e) => {

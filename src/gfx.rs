@@ -179,8 +179,17 @@ pub struct Renderer {
     globals_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
+    globals_layout: wgpu::BindGroupLayout,
     model_layout: wgpu::BindGroupLayout,
+    font_layout: wgpu::BindGroupLayout,
     font_bind_group: wgpu::BindGroup,
+
+    /// Multisample count in force, and the counts this adapter will take.
+    samples: u32,
+    supported_samples: Vec<u32>,
+    /// Multisampled colour attachment the window's frame is drawn into and
+    /// resolved from. `None` at one sample, where there is nothing to resolve.
+    msaa_view: Option<wgpu::TextureView>,
 
     voxel_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
@@ -191,8 +200,9 @@ pub struct Renderer {
     /// The viewer's palette, kept so a thumbnail render can borrow the shared
     /// palette buffer and hand it back untouched.
     palette_linear: [[f32; 4]; 256],
-    /// Depth attachment for off-screen thumbnails, sized on first use.
-    thumb_depth: Option<(u32, wgpu::TextureView)>,
+    /// Depth and multisample attachments for off-screen thumbnails, sized on
+    /// first use and kept for the rest of the folder.
+    thumb_targets: Option<ThumbTargets>,
     egui: egui_wgpu::Renderer,
     hud_vertices: GrowBuffer,
     hud_indices: GrowBuffer,
@@ -205,7 +215,7 @@ pub struct Renderer {
 
 impl Renderer {
     /// Bring up a device and all three pipelines for `window`.
-    pub fn new(window: Arc<winit::window::Window>) -> Result<Renderer> {
+    pub fn new(window: Arc<winit::window::Window>, samples: u32) -> Result<Renderer> {
         let size = window.inner_size();
         let (width, height) = (size.width.max(1), size.height.max(1));
 
@@ -238,7 +248,7 @@ impl Renderer {
             view_formats: vec![],
         };
         surface.configure(&device, &config);
-        Renderer::build(Some(surface), &adapter, device, queue, config)
+        Renderer::build(Some(surface), &adapter, device, queue, config, samples)
     }
 
     /// The same device and pipelines with nothing to present to.
@@ -247,7 +257,7 @@ impl Renderer {
     /// fallback adapter if no real one answers, so it comes up on a CI box
     /// with no display and no graphics card at all -- which is the point:
     /// the render path gets exercised on every push, not only on a desktop.
-    pub fn headless(width: u32, height: u32) -> Result<Renderer> {
+    pub fn headless(width: u32, height: u32, samples: u32) -> Result<Renderer> {
         let (width, height) = (width.max(1), height.max(1));
         let instance = create_instance();
         let adapter = request_adapter(&instance, None)
@@ -266,7 +276,7 @@ impl Renderer {
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
         };
-        Renderer::build(None, &adapter, device, queue, config)
+        Renderer::build(None, &adapter, device, queue, config, samples)
     }
 
     /// Everything the windowed and off-screen paths have in common.
@@ -276,11 +286,15 @@ impl Renderer {
         device: wgpu::Device,
         queue: wgpu::Queue,
         config: wgpu::SurfaceConfiguration,
+        samples: u32,
     ) -> Result<Renderer> {
         let adapter_name = adapter.get_info().name;
         let format = config.format;
         let (width, height) = (config.width, config.height);
-        let depth_view = create_depth(&device, width, height);
+        let supported_samples = supported_samples(adapter, &device, format);
+        let samples = nearest(&supported_samples, samples);
+        let depth_view = create_depth(&device, width, height, samples);
+        let msaa_view = create_msaa(&device, format, width, height, samples);
 
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
@@ -350,9 +364,11 @@ impl Renderer {
         });
         let font_bind_group = create_font(&device, &queue, &font_layout);
 
-        let voxel_pipeline = create_voxel_pipeline(&device, format, &globals_layout, &model_layout);
-        let line_pipeline = create_line_pipeline(&device, format, &globals_layout);
-        let hud_pipeline = create_hud_pipeline(&device, format, &globals_layout, &font_layout);
+        let voxel_pipeline =
+            create_voxel_pipeline(&device, format, samples, &globals_layout, &model_layout);
+        let line_pipeline = create_line_pipeline(&device, format, samples, &globals_layout);
+        let hud_pipeline =
+            create_hud_pipeline(&device, format, samples, &globals_layout, &font_layout);
 
         let model_stride = device.limits().min_uniform_buffer_offset_alignment.max(64);
 
@@ -360,9 +376,10 @@ impl Renderer {
             &device,
             format,
             egui_wgpu::RendererOptions {
-                // egui draws over the finished 3D frame in its own pass and
-                // never needs depth; MSAA is off for the same reason the
-                // voxel pipeline does without it.
+                // egui draws over the finished 3D frame, after the resolve,
+                // in a pass of its own that never needs depth. Its own
+                // geometry is already antialiased by its tessellator, so one
+                // sample is the right number whatever the 3D view is using.
                 msaa_samples: 1,
                 depth_stencil_format: None,
                 ..Default::default()
@@ -381,15 +398,20 @@ impl Renderer {
             globals_buffer,
             palette_buffer,
             globals_bind_group,
+            globals_layout,
             model_layout,
+            font_layout,
             font_bind_group,
+            samples,
+            supported_samples,
+            msaa_view,
             voxel_pipeline,
             line_pipeline,
             hud_pipeline,
             scene: None,
             overlays: None,
             palette_linear: [[0.0; 4]; 256],
-            thumb_depth: None,
+            thumb_targets: None,
             egui,
             hud_vertices,
             hud_indices,
@@ -416,7 +438,69 @@ impl Renderer {
         if let Some(surface) = &self.surface {
             surface.configure(&self.device, &self.config);
         }
-        self.depth_view = create_depth(&self.device, width, height);
+        self.rebuild_targets();
+    }
+
+    /// Multisample count currently in force.
+    pub fn samples(&self) -> u32 {
+        self.samples
+    }
+
+    /// The counts this adapter will accept, low to high. Always contains 1.
+    pub fn supported_samples(&self) -> &[u32] {
+        &self.supported_samples
+    }
+
+    /// Switch multisampling on, off, or to another count.
+    ///
+    /// Returns the count actually in force: an adapter that cannot do the one
+    /// asked for gets the nearest it can do at or below it, so a settings
+    /// file copied between machines degrades instead of failing.
+    pub fn set_samples(&mut self, wanted: u32) -> u32 {
+        let samples = nearest(&self.supported_samples, wanted);
+        if samples == self.samples {
+            return samples;
+        }
+        self.samples = samples;
+        // Every pipeline states its sample count, and a pass whose pipelines
+        // disagree with its attachments is a validation error, so these three
+        // and the attachments have to move together.
+        self.voxel_pipeline = create_voxel_pipeline(
+            &self.device,
+            self.config.format,
+            samples,
+            &self.globals_layout,
+            &self.model_layout,
+        );
+        self.line_pipeline = create_line_pipeline(
+            &self.device,
+            self.config.format,
+            samples,
+            &self.globals_layout,
+        );
+        self.hud_pipeline = create_hud_pipeline(
+            &self.device,
+            self.config.format,
+            samples,
+            &self.globals_layout,
+            &self.font_layout,
+        );
+        self.rebuild_targets();
+        self.thumb_targets = None;
+        samples
+    }
+
+    /// Re-make the attachments that depend on the size or the sample count.
+    fn rebuild_targets(&mut self) {
+        let (width, height) = (self.config.width, self.config.height);
+        self.depth_view = create_depth(&self.device, width, height, self.samples);
+        self.msaa_view = create_msaa(
+            &self.device,
+            self.config.format,
+            width,
+            height,
+            self.samples,
+        );
     }
 
     /// Reconfigure after a surface error; cheap enough to do on the spot.
@@ -732,8 +816,12 @@ impl Renderer {
         self.queue
             .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
 
-        if self.thumb_depth.as_ref().is_none_or(|(s, _)| *s != size) {
-            self.thumb_depth = Some((size, create_depth(&self.device, size, size)));
+        if self.thumb_targets.as_ref().is_none_or(|t| t.size != size) {
+            self.thumb_targets = Some(ThumbTargets {
+                size,
+                depth: create_depth(&self.device, size, size, self.samples),
+                msaa: create_msaa(&self.device, self.config.format, size, size, self.samples),
+            });
         }
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -758,20 +846,24 @@ impl Renderer {
                 label: Some("thumbnail"),
             });
         {
-            let depth = &self.thumb_depth.as_ref().expect("set just above").1;
+            let targets = self.thumb_targets.as_ref().expect("set just above");
+            let (attachment, resolve, store) = match &targets.msaa {
+                Some(msaa) => (msaa, Some(&view), wgpu::StoreOp::Discard),
+                None => (&view, None, wgpu::StoreOp::Store),
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("thumbnail"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: attachment,
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target: resolve,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
+                        store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth,
+                    view: &targets.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
@@ -915,15 +1007,22 @@ impl Renderer {
         let clear = params
             .background
             .clear(if opaque_background { 1.0 } else { 0.0 });
+        // With multisampling on, the frame is drawn into the sample buffer
+        // and resolved into `color` at the end of the pass; the samples
+        // themselves are never read again, so they need not be stored.
+        let (view, resolve, store) = match &self.msaa_view {
+            Some(msaa) => (msaa, Some(color), wgpu::StoreOp::Discard),
+            None => (color, None, wgpu::StoreOp::Store),
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("scene"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: color,
+                view,
                 depth_slice: None,
-                resolve_target: None,
+                resolve_target: resolve,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(clear),
-                    store: wgpu::StoreOp::Store,
+                    store,
                 },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -1022,7 +1121,89 @@ fn uniform_entry(
     }
 }
 
-fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+/// Multisample counts the viewer offers, low to high.
+pub const SAMPLE_COUNTS: [u32; 4] = [1, 2, 4, 8];
+
+/// Off-screen attachments for one thumbnail size.
+struct ThumbTargets {
+    size: u32,
+    depth: wgpu::TextureView,
+    /// `None` at one sample, where the render goes straight to the readable
+    /// texture instead of through a resolve.
+    msaa: Option<wgpu::TextureView>,
+}
+
+/// The counts from [`SAMPLE_COUNTS`] this device can do for both the colour
+/// and the depth attachment. One sample is always in the list.
+///
+/// The adapter's own answer is the wider one, and taking it at face value is
+/// how you get a validation error rather than a picture: unless the device was
+/// opened with `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`, only the counts
+/// WebGPU guarantees may actually be used.
+fn supported_samples(
+    adapter: &wgpu::Adapter,
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> Vec<u32> {
+    let specific = device
+        .features()
+        .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
+    let colour = adapter.get_texture_format_features(format).flags;
+    let depth = adapter.get_texture_format_features(DEPTH_FORMAT).flags;
+    SAMPLE_COUNTS
+        .into_iter()
+        .filter(|&n| {
+            n == 1
+                || ((n == 4 || specific)
+                    && colour.sample_count_supported(n)
+                    && depth.sample_count_supported(n))
+        })
+        .collect()
+}
+
+/// The largest supported count no greater than `wanted`, or the smallest
+/// there is if even that is too many.
+fn nearest(supported: &[u32], wanted: u32) -> u32 {
+    supported
+        .iter()
+        .copied()
+        .filter(|&n| n <= wanted)
+        .max()
+        .or_else(|| supported.iter().copied().min())
+        .unwrap_or(1)
+}
+
+fn create_msaa(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    samples: u32,
+) -> Option<wgpu::TextureView> {
+    if samples <= 1 {
+        return None;
+    }
+    Some(
+        device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("msaa colour"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default()),
+    )
+}
+
+fn create_depth(device: &wgpu::Device, width: u32, height: u32, samples: u32) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some("depth"),
@@ -1032,7 +1213,7 @@ fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1142,9 +1323,13 @@ fn request_adapter(
 }
 
 fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue)> {
+    // The only optional feature asked for anywhere, and only when the adapter
+    // already has it: without it a device may use no sample count beyond the
+    // 1 and 4 WebGPU guarantees, whatever the adapter reports it can do.
+    let extras = adapter.features() & wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("voxview device"),
-        required_features: wgpu::Features::empty(),
+        required_features: extras,
         // Ask for exactly what this adapter offers: nothing here needs more
         // than the downlevel defaults, which integrated GPUs all satisfy.
         required_limits: adapter.limits(),
@@ -1166,6 +1351,7 @@ fn depth_state(write: bool, compare: wgpu::CompareFunction) -> Option<wgpu::Dept
 fn create_voxel_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
+    samples: u32,
     globals: &wgpu::BindGroupLayout,
     model: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
@@ -1200,7 +1386,10 @@ fn create_voxel_pipeline(
             ..Default::default()
         },
         depth_stencil: depth_state(true, wgpu::CompareFunction::Less),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: Some("fs_main"),
@@ -1219,6 +1408,7 @@ fn create_voxel_pipeline(
 fn create_line_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
+    samples: u32,
     globals: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1251,7 +1441,10 @@ fn create_line_pipeline(
         },
         // Lines read depth so the model hides them, but do not write it.
         depth_stencil: depth_state(false, wgpu::CompareFunction::Less),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: Some("fs_main"),
@@ -1270,6 +1463,7 @@ fn create_line_pipeline(
 fn create_hud_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
+    samples: u32,
     globals: &wgpu::BindGroupLayout,
     font_layout: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
@@ -1301,7 +1495,10 @@ fn create_hud_pipeline(
         // The HUD sits on top of everything, but the pass it joins has a
         // depth attachment, so the pipeline has to declare the same format.
         depth_stencil: depth_state(false, wgpu::CompareFunction::Always),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: Some("fs_main"),

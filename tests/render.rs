@@ -103,7 +103,14 @@ impl Shot {
 /// CI sets `VOXVIEW_REQUIRE_GPU`, which turns the skip into a failure, so the
 /// coverage cannot quietly evaporate on the one machine that matters.
 fn renderer() -> Option<Renderer> {
-    match Renderer::headless(SIZE, SIZE) {
+    // One sample everywhere except the test that is about multisampling:
+    // these assertions are about geometry and palette, and an antialiased
+    // edge only blurs the thing being measured.
+    renderer_with(1)
+}
+
+fn renderer_with(samples: u32) -> Option<Renderer> {
+    match Renderer::headless(SIZE, SIZE, samples) {
         Ok(renderer) => {
             eprintln!("rendering on: {}", renderer.adapter_name);
             Some(renderer)
@@ -268,6 +275,59 @@ fn the_same_input_renders_the_same_bytes_twice() {
     assert_eq!(
         first.pixels, second.pixels,
         "two renders of one fixture disagree; something is carrying state between frames"
+    );
+}
+
+#[test]
+fn multisampling_softens_the_edges_of_the_model() {
+    let Some(mut plain) = renderer_with(1) else {
+        return;
+    };
+    let Some(mut smooth) = renderer_with(4) else {
+        return;
+    };
+    if smooth.samples() == 1 {
+        eprintln!("skipping: this adapter does not do 4x multisampling");
+        return;
+    }
+
+    let data = fixtures::single_cube();
+    let hard = shoot(&mut plain, &data, "aliased");
+    let soft = shoot(&mut smooth, &data, "antialiased");
+
+    // The thumbnail renders on a transparent ground, so a pixel the edge only
+    // partly covers comes back partly transparent -- and at one sample there
+    // is no such thing: every pixel is all model or all background. Counting
+    // the in-between alphas is therefore a direct measure of whether the
+    // resolve happened at all, on any rasteriser.
+    let partial = |shot: &Shot| {
+        shot.pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| (8..248).contains(&p[3]))
+            .count()
+    };
+    let (hard_edge, soft_edge) = (partial(&hard), partial(&soft));
+    eprintln!(
+        "edge pixels: {hard_edge} at 1x, {soft_edge} at {}x",
+        smooth.samples()
+    );
+    assert_eq!(
+        hard_edge, 0,
+        "one sample per pixel should leave no partly covered pixels"
+    );
+    assert!(
+        soft_edge > 32,
+        "multisampling should leave a rim of partly covered pixels, found {soft_edge}"
+    );
+
+    // It is the same cube either way: antialiasing is an edge treatment, not
+    // a change of framing.
+    let (a, b) = (hard.coverage(), soft.coverage());
+    assert!(
+        (a - b).abs() < 0.02,
+        "coverage moved from {a:.3} to {b:.3}; that is more than an edge"
     );
 }
 

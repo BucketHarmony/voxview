@@ -64,6 +64,7 @@ pub enum Toggle {
     Axes,
     Occlusion,
     Orthographic,
+    Msaa,
     Background,
 }
 
@@ -86,6 +87,8 @@ pub struct ViewerChrome<'a> {
     pub show_axes: bool,
     pub occlusion: bool,
     pub orthographic: bool,
+    /// Multisample count in force, for the pill that cycles it.
+    pub samples: u32,
     pub error: Option<&'a str>,
 }
 
@@ -1469,6 +1472,13 @@ impl Ui {
                         if ui.selectable_label(on, label).clicked() {
                             self.actions.push(Action::Toggle(toggle));
                         }
+                    }
+                    let msaa = match chrome.samples {
+                        1 => "MSAA off  S".to_owned(),
+                        n => format!("MSAA {n}x  S"),
+                    };
+                    if ui.selectable_label(chrome.samples > 1, msaa).clicked() {
+                        self.actions.push(Action::Toggle(Toggle::Msaa));
                     }
                     if ui.button("Background  T").clicked() {
                         self.actions.push(Action::Toggle(Toggle::Background));
