@@ -1004,6 +1004,21 @@ impl App {
     }
 }
 
+/// The window icon, decoded from the same PNG the build script turns into the
+/// Windows executable's resource.
+///
+/// Embedded rather than loaded from disk: a viewer that shows its icon only
+/// when run from the source tree is worse than one with no icon at all. Any
+/// failure here is silent, because a window without a picture on it is not
+/// worth a message on stderr.
+fn window_icon() -> Option<winit::window::Icon> {
+    let decoded = image::load_from_memory(include_bytes!("../assets/voxview.png"))
+        .ok()?
+        .into_rgba8();
+    let (width, height) = decoded.dimensions();
+    winit::window::Icon::from_rgba(decoded.into_raw(), width, height).ok()
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // On mobile backends this fires again after a suspend; there is
@@ -1014,10 +1029,20 @@ impl ApplicationHandler for App {
         let saved = self.settings.window.sane();
         let mut attributes = Window::default_attributes()
             .with_title(format!("voxview - {}", self.path().display()))
+            .with_window_icon(window_icon())
             .with_inner_size(LogicalSize::new(saved.width as f64, saved.height as f64))
             .with_maximized(saved.maximized);
         if let (Some(x), Some(y)) = (saved.x, saved.y) {
             attributes = attributes.with_position(LogicalPosition::new(x as f64, y as f64));
+        }
+        // Wayland has no protocol for an application to hand the compositor a
+        // picture, so the icon there comes from a .desktop file matched by
+        // app id. Setting the id is the only half of that which is ours to do;
+        // `assets/voxview.desktop` is the other.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attributes = attributes.with_name("voxview", "voxview");
         }
         let window = match event_loop.create_window(attributes) {
             Ok(w) => Arc::new(w),

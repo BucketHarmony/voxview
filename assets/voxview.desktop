@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=voxview
+GenericName=Voxel Viewer
+Comment=View and browse MagicaVoxel .vox files
+Exec=voxview %f
+Icon=voxview
+Terminal=false
+Categories=Graphics;Viewer;3DGraphics;
+MimeType=model/x-vox;
+StartupNotify=true
+# Matches the app id the window sets, which is how a Wayland compositor and a
+# GNOME task switcher find the icon above.
+StartupWMClass=voxview

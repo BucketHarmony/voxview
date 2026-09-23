@@ -1,0 +1,141 @@
+name: Release
+
+# Tag a commit `v0.2.0` and push it; everything below follows from that.
+#
+#   cargo set-version 0.2.0   # or edit Cargo.toml by hand
+#   git commit -am "Release 0.2.0" && git tag v0.2.0 && git push --follow-tags
+#
+# Binaries are built for the two platforms the project actually promises.
+# macOS builds in CI on every push, but an unsigned, unnotarised .app that
+# Gatekeeper refuses to open is worse than no download at all, so it is not
+# published here.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build, for a dry run"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A tag that disagrees with Cargo.toml produces an archive whose name lies
+  # about what is inside it. Cheaper to catch here than after publishing.
+  check-version:
+    name: tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compare
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "tag $tag, Cargo.toml $crate"
+          test "$tag" = "$crate"
+        if: startsWith(github.ref, 'refs/tags/')
+
+  build:
+    name: ${{ matrix.target }}
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install the Linux windowing headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwayland-dev libxkbcommon-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The binary has to at least start and read a file it wrote itself. A
+      # release that was never run is a release that is broken on arrival.
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/voxview"
+          if [ "${{ runner.os }}" = "Windows" ]; then bin="$bin.exe"; fi
+          "$bin" --version
+          "$bin" --write-fixtures "${{ runner.temp }}/fixtures"
+          "$bin" --stats "${{ runner.temp }}/fixtures/materials.vox"
+
+      - name: Stage the archive
+        shell: bash
+        run: |
+          name="voxview-${GITHUB_REF_NAME:-dev}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/voxview.exe" "dist/$name/"
+          else
+            cp "target/${{ matrix.target }}/release/voxview" "dist/$name/"
+            cp assets/voxview.desktop assets/voxview.png "dist/$name/"
+          fi
+          cp README.md NOTES.md THIRD-PARTY.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          echo "ARCHIVE=$name" >> "$GITHUB_ENV"
+
+      - name: Archive (Linux)
+        if: runner.os == 'Linux'
+        run: tar -C dist -czf "dist/$ARCHIVE.tar.gz" "$ARCHIVE"
+
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/$env:ARCHIVE" -DestinationPath "dist/$env:ARCHIVE.zip"
+
+      - name: Checksum
+        shell: bash
+        run: |
+          cd dist
+          for f in *.tar.gz *.zip; do
+            [ -e "$f" ] || continue
+            if command -v sha256sum >/dev/null; then sha256sum "$f" > "$f.sha256";
+            else certutil -hashfile "$f" SHA256 | sed -n 2p > "$f.sha256"; fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

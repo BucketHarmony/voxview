@@ -6,6 +6,7 @@ description = "A standalone MagicaVoxel .vox viewer and asset browser"
 authors = ["Kenneth Raisor"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+build = "build.rs"
 keywords = ["magicavoxel", "vox", "voxel", "viewer", "wgpu"]
 categories = ["visualization", "graphics", "command-line-utilities"]
 
@@ -34,6 +35,11 @@ notify = "8.2"
 pollster = "0.4"
 wgpu = "30.0"
 winit = "0.30"
+
+# Only for stamping the icon into voxview.exe; see build.rs. Target-gated, so
+# a Linux or macOS build never fetches it.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level = 3

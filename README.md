@@ -11,6 +11,28 @@ window rather than a few thousand file-open dialogs.
 
 Single crate, single binary. No game engine.
 
+## Install
+
+Pre-built binaries for Linux and Windows (x86-64) are attached to each
+[release](https://github.com/BucketHarmony/voxview/releases), each with a
+SHA-256 beside it. There is nothing to install: unpack the archive and run
+`voxview`. macOS builds and is tested on every push, but no macOS binary is
+published — an unsigned, unnotarised download that Gatekeeper refuses to open
+would be worse than none.
+
+On Linux, `voxview.desktop` and `voxview.png` come in the archive if you want
+the viewer in your application menu and its icon on the window:
+
+```sh
+install -Dm755 voxview        ~/.local/bin/voxview
+install -Dm644 voxview.desktop ~/.local/share/applications/voxview.desktop
+install -Dm644 voxview.png     ~/.local/share/icons/hicolor/256x256/apps/voxview.png
+```
+
+Wayland has no way for a program to hand the compositor a picture, so the
+`.desktop` file is how the icon gets there; on X11 and Windows the binary
+carries its own.
+
 ## Build
 
 ```sh
@@ -287,6 +309,11 @@ matters, why it is shaped the way it is. The short version:
 | `sysfont` | Finding a system font when a file name is outside what egui bundles |
 | `watch`, `menu`, `app` | The file watcher, the text file menu, and the event loop that ties it together |
 | `fixtures` | The four test `.vox` files, written from code so no editor is needed |
+
+`assets/` holds the icon in the two forms it is needed in — a 256×256 PNG the
+binary embeds for its window, and a seven-size `.ico` that `build.rs` stamps
+into `voxview.exe` — plus `make-icon.py`, which draws both. The script is the
+source; the images are checked in so that building needs nothing but Cargo.
 
 `NOTES.md` is the other half of the documentation, and the more useful half if
 you are about to touch the parser: it records what the `.vox` format and
