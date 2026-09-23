@@ -10,6 +10,7 @@
 //! Meshes are built in the model's own local space, `0..size`. Placing them in
 //! the world is the model matrix's job (see [`crate::scene::VoxTransform`]).
 
+use crate::material::Materials;
 use crate::model::VoxelGrid;
 use glam::{IVec3, Vec3};
 
@@ -57,15 +58,64 @@ impl Vertex {
 }
 
 /// Triangles for one model.
+///
+/// Indices are grouped by which pass draws them: opaque first, then whatever
+/// has to be blended. Keeping the split inside the mesh means the renderer
+/// draws two ranges of one buffer rather than juggling two meshes per model.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+    /// How many leading entries of `indices` are opaque.
+    opaque_indices: usize,
 }
 
 impl Mesh {
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
+    }
+
+    /// Where the opaque indices end and the transparent ones begin.
+    pub fn opaque_indices(&self) -> usize {
+        self.opaque_indices
+    }
+
+    pub fn has_transparency(&self) -> bool {
+        self.opaque_indices < self.indices.len()
+    }
+
+    /// Move every face whose palette entry is in `transparent` to the end of
+    /// the index list, and record where the move started.
+    ///
+    /// This is a partition rather than a sort: the blended pass draws these
+    /// faces in whatever order the mesher produced, which is correct against
+    /// opaque geometry and approximate against other glass. Sorting them per
+    /// frame would cost more than a preview is worth, and back-face culling
+    /// already keeps a single convex pane honest.
+    pub fn sort_by_transparency(&mut self, transparent: &[u64; 4]) {
+        if *transparent == [0u64; 4] {
+            self.opaque_indices = self.indices.len();
+            return;
+        }
+        let vertices = &self.vertices;
+        // A triangle never straddles two palette entries, so its first corner
+        // decides for all three.
+        let is_opaque = |tri: &[u32]| {
+            let i = vertices[tri[0] as usize].palette_index() as usize;
+            transparent[i / 64] & (1 << (i % 64)) == 0
+        };
+        let mut opaque = Vec::with_capacity(self.indices.len());
+        let mut blended = Vec::new();
+        for tri in self.indices.chunks(3) {
+            if is_opaque(tri) {
+                opaque.extend_from_slice(tri);
+            } else {
+                blended.extend_from_slice(tri);
+            }
+        }
+        self.opaque_indices = opaque.len();
+        opaque.extend_from_slice(&blended);
+        self.indices = opaque;
     }
 
     /// Number of merged rectangles; four vertices each.
@@ -84,6 +134,8 @@ impl Mesh {
         }
         self.indices
             .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        // Everything is opaque until a material table says otherwise.
+        self.opaque_indices = self.indices.len();
     }
 }
 
@@ -152,8 +204,21 @@ pub fn greedy_mesh(grid: &VoxelGrid) -> Mesh {
 
 /// Mesh every model in a scene. Models are meshed once even when a scene
 /// instances them several times.
-pub fn mesh_models(models: &[VoxelGrid]) -> Vec<Mesh> {
-    models.iter().map(greedy_mesh).collect()
+///
+/// The material table is needed only to decide which faces go in the blended
+/// pass; nothing else about a material reaches the geometry, because a
+/// material belongs to a palette entry and the palette index is already in
+/// every vertex.
+pub fn mesh_models(models: &[VoxelGrid], materials: &Materials) -> Vec<Mesh> {
+    let transparent = materials.transparent_mask();
+    models
+        .iter()
+        .map(|grid| {
+            let mut mesh = greedy_mesh(grid);
+            mesh.sort_by_transparency(&transparent);
+            mesh
+        })
+        .collect()
 }
 
 fn unit(axis: usize) -> IVec3 {
@@ -432,6 +497,39 @@ mod tests {
             mesh.vertices.iter().any(|v| v.ao() < 255),
             "the concave corner should be occluded"
         );
+    }
+
+    #[test]
+    fn transparent_faces_move_to_the_end_of_the_index_list() {
+        let mut g = VoxelGrid::new(UVec3::new(2, 1, 1)).unwrap();
+        g.set(UVec3::new(0, 0, 0), Some(7));
+        g.set(UVec3::new(1, 0, 0), Some(200));
+        let mut mesh = greedy_mesh(&g);
+        let total = mesh.indices.len();
+        assert_eq!(mesh.opaque_indices(), total, "nothing is transparent yet");
+
+        let mut mask = [0u64; 4];
+        mask[200 / 64] |= 1 << (200 % 64);
+        mesh.sort_by_transparency(&mask);
+
+        assert_eq!(mesh.indices.len(), total, "no triangle was lost");
+        assert!(mesh.has_transparency());
+        let palette_of = |i: usize| mesh.vertices[mesh.indices[i] as usize].palette_index();
+        assert!(
+            (0..mesh.opaque_indices()).all(|i| palette_of(i) == 7),
+            "the opaque range should hold only the opaque colour"
+        );
+        assert!(
+            (mesh.opaque_indices()..total).all(|i| palette_of(i) == 200),
+            "the blended range should hold only the transparent colour"
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_transparency_leaves_every_face_in_the_opaque_pass() {
+        let meshes = mesh_models(&[solid(UVec3::new(3, 3, 3))], &Materials::default());
+        assert!(!meshes[0].has_transparency());
+        assert_eq!(meshes[0].opaque_indices(), meshes[0].indices.len());
     }
 
     #[test]

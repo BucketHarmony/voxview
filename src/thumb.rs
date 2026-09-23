@@ -311,7 +311,7 @@ fn prepare(path: &Path, cache_dir: Option<&Path>) -> Ready {
 
     match loader::load_file(path) {
         Ok(scene) => {
-            let meshes = mesh::mesh_models(&scene.models);
+            let meshes = mesh::mesh_models(&scene.models, &scene.materials);
             Ready::Meshed {
                 path: path.to_path_buf(),
                 scene: Box::new(scene),

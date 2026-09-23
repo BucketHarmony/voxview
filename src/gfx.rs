@@ -146,6 +146,8 @@ struct GpuMesh {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
+    /// Where the opaque indices end; the rest belong to the blended pass.
+    opaque_indices: u32,
 }
 
 /// One instance to draw: which model, and where its matrix sits in the
@@ -162,6 +164,9 @@ struct GpuScene {
     /// Kept so the camera can re-frame without re-reading the file.
     bounds: Bounds,
     triangle_count: usize,
+    /// Whether any mesh has faces for the blended pass, so a scene without
+    /// glass never binds the pipeline that draws it.
+    has_transparency: bool,
 }
 
 struct GpuOverlays {
@@ -194,6 +199,8 @@ pub struct Renderer {
     msaa_view: Option<wgpu::TextureView>,
 
     voxel_pipeline: wgpu::RenderPipeline,
+    /// The same shader, blended and without depth writes, for glass.
+    glass_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     hud_pipeline: wgpu::RenderPipeline,
 
@@ -378,8 +385,22 @@ impl Renderer {
         });
         let font_bind_group = create_font(&device, &queue, &font_layout);
 
-        let voxel_pipeline =
-            create_voxel_pipeline(&device, format, samples, &globals_layout, &model_layout);
+        let voxel_pipeline = create_voxel_pipeline(
+            &device,
+            format,
+            samples,
+            &globals_layout,
+            &model_layout,
+            Pass::Opaque,
+        );
+        let glass_pipeline = create_voxel_pipeline(
+            &device,
+            format,
+            samples,
+            &globals_layout,
+            &model_layout,
+            Pass::Blended,
+        );
         let line_pipeline = create_line_pipeline(&device, format, samples, &globals_layout);
         let hud_pipeline =
             create_hud_pipeline(&device, format, samples, &globals_layout, &font_layout);
@@ -421,6 +442,7 @@ impl Renderer {
             supported_samples,
             msaa_view,
             voxel_pipeline,
+            glass_pipeline,
             line_pipeline,
             hud_pipeline,
             scene: None,
@@ -479,14 +501,23 @@ impl Renderer {
         }
         self.samples = samples;
         // Every pipeline states its sample count, and a pass whose pipelines
-        // disagree with its attachments is a validation error, so these three
-        // and the attachments have to move together.
+        // disagree with its attachments is a validation error, so all four and
+        // the attachments have to move together.
         self.voxel_pipeline = create_voxel_pipeline(
             &self.device,
             self.config.format,
             samples,
             &self.globals_layout,
             &self.model_layout,
+            Pass::Opaque,
+        );
+        self.glass_pipeline = create_voxel_pipeline(
+            &self.device,
+            self.config.format,
+            samples,
+            &self.globals_layout,
+            &self.model_layout,
+            Pass::Blended,
         );
         self.line_pipeline = create_line_pipeline(
             &self.device,
@@ -582,6 +613,7 @@ impl Renderer {
                         usage: wgpu::BufferUsages::INDEX,
                     }),
                 index_count: mesh.indices.len() as u32,
+                opaque_indices: mesh.opaque_indices() as u32,
             })
             .collect();
 
@@ -625,6 +657,7 @@ impl Renderer {
         });
 
         GpuScene {
+            has_transparency: gpu_meshes.iter().any(|m| m.opaque_indices < m.index_count),
             meshes: gpu_meshes,
             draws,
             model_bind_group,
@@ -902,20 +935,13 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.voxel_pipeline);
-            pass.set_bind_group(0, &self.globals_bind_group, &[]);
-            for draw in &gpu.draws {
-                let Some(mesh) = gpu.meshes.get(draw.mesh) else {
-                    continue;
-                };
-                if mesh.index_count == 0 {
-                    continue;
-                }
-                pass.set_bind_group(1, &gpu.model_bind_group, &[draw.uniform_offset]);
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
+            draw_models(
+                &mut pass,
+                &gpu,
+                &self.globals_bind_group,
+                &self.voxel_pipeline,
+                &self.glass_pipeline,
+            );
         }
         self.queue.submit(Some(encoder.finish()));
 
@@ -1077,20 +1103,13 @@ impl Renderer {
         }
 
         if let Some(scene) = &self.scene {
-            pass.set_pipeline(&self.voxel_pipeline);
-            pass.set_bind_group(0, &self.globals_bind_group, &[]);
-            for draw in &scene.draws {
-                let Some(mesh) = scene.meshes.get(draw.mesh) else {
-                    continue;
-                };
-                if mesh.index_count == 0 {
-                    continue;
-                }
-                pass.set_bind_group(1, &scene.model_bind_group, &[draw.uniform_offset]);
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
+            draw_models(
+                &mut pass,
+                scene,
+                &self.globals_bind_group,
+                &self.voxel_pipeline,
+                &self.glass_pipeline,
+            );
         }
 
         if let Some(overlays) = &self.overlays {
@@ -1372,6 +1391,51 @@ fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue)
     .context("could not open a graphics device")
 }
 
+/// Draw every instance of a scene: opaque geometry first, then whatever has
+/// to be blended over it.
+///
+/// One pipeline switch for the whole transparent pass rather than one per
+/// model, which is why the meshes keep their two index ranges in one buffer.
+fn draw_models(
+    pass: &mut wgpu::RenderPass<'_>,
+    scene: &GpuScene,
+    globals: &wgpu::BindGroup,
+    opaque: &wgpu::RenderPipeline,
+    glass: &wgpu::RenderPipeline,
+) {
+    pass.set_bind_group(0, globals, &[]);
+    for blended in [false, true] {
+        if blended && !scene.has_transparency {
+            break;
+        }
+        pass.set_pipeline(if blended { glass } else { opaque });
+        for draw in &scene.draws {
+            let Some(mesh) = scene.meshes.get(draw.mesh) else {
+                continue;
+            };
+            let range = if blended {
+                mesh.opaque_indices..mesh.index_count
+            } else {
+                0..mesh.opaque_indices
+            };
+            if range.is_empty() {
+                continue;
+            }
+            pass.set_bind_group(1, &scene.model_bind_group, &[draw.uniform_offset]);
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(range, 0, 0..1);
+        }
+    }
+}
+
+/// Which of the two voxel passes a pipeline is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Opaque,
+    Blended,
+}
+
 fn depth_state(write: bool, compare: wgpu::CompareFunction) -> Option<wgpu::DepthStencilState> {
     Some(wgpu::DepthStencilState {
         format: DEPTH_FORMAT,
@@ -1382,13 +1446,20 @@ fn depth_state(write: bool, compare: wgpu::CompareFunction) -> Option<wgpu::Dept
     })
 }
 
+/// The voxel pipeline, in one of its two flavours.
+///
+/// The blended one still tests depth, so glass is hidden by the wall in front
+/// of it, but it does not write depth: two panes of the same window would
+/// otherwise reject each other and the second one would vanish.
 fn create_voxel_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     samples: u32,
     globals: &wgpu::BindGroupLayout,
     model: &wgpu::BindGroupLayout,
+    kind: Pass,
 ) -> wgpu::RenderPipeline {
+    let blended = kind == Pass::Blended;
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("voxel"),
         source: wgpu::ShaderSource::Wgsl(include_str!("shaders/voxel.wgsl").into()),
@@ -1401,7 +1472,7 @@ fn create_voxel_pipeline(
     });
     let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("voxel"),
+        label: Some(if blended { "voxel glass" } else { "voxel" }),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -1419,7 +1490,7 @@ fn create_voxel_pipeline(
             cull_mode: Some(wgpu::Face::Back),
             ..Default::default()
         },
-        depth_stencil: depth_state(true, wgpu::CompareFunction::Less),
+        depth_stencil: depth_state(!blended, wgpu::CompareFunction::Less),
         multisample: wgpu::MultisampleState {
             count: samples,
             ..Default::default()
@@ -1430,7 +1501,7 @@ fn create_voxel_pipeline(
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: None,
+                blend: blended.then_some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),

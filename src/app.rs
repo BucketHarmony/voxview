@@ -489,7 +489,7 @@ impl App {
     /// One off-screen render, saved beside its model.
     fn write_png(&mut self, path: &Path) -> Result<()> {
         let scene = loader::load_file(path)?;
-        let meshes = mesh::mesh_models(&scene.models);
+        let meshes = mesh::mesh_models(&scene.models, &scene.materials);
         let renderer = self
             .renderer
             .as_mut()
@@ -554,7 +554,7 @@ impl App {
         let load_ms = started.elapsed().as_secs_f32() * 1000.0;
 
         let started = Instant::now();
-        let meshes = mesh::mesh_models(&scene.models);
+        let meshes = mesh::mesh_models(&scene.models, &scene.materials);
         let mesh_ms = started.elapsed().as_secs_f32() * 1000.0;
 
         if let Some(renderer) = &mut self.renderer {

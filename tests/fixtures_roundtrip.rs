@@ -44,7 +44,7 @@ fn a_solid_cube_meshes_to_six_quads() {
     assert_eq!(scene.models[0].size(), glam::UVec3::splat(4));
     assert_eq!(scene.voxel_count, 64);
 
-    let meshes = mesh::mesh_models(&scene.models);
+    let meshes = mesh::mesh_models(&scene.models, &scene.materials);
     // Every face of a solid box has uniform shading, so each side merges into
     // a single quad: 6 quads, 12 triangles.
     assert_eq!(meshes[0].quad_count(), 6);
@@ -57,7 +57,7 @@ fn a_checkerboard_merges_nothing() {
     let grid = &scene.models[0];
     assert_eq!(grid.size(), glam::UVec3::splat(8));
 
-    let meshes = mesh::mesh_models(&scene.models);
+    let meshes = mesh::mesh_models(&scene.models, &scene.materials);
     // No two exposed faces are adjacent, so the greedy pass cannot combine
     // any of them: one quad per exposed face is the floor for this mesher.
     assert_eq!(meshes[0].quad_count(), mesh::exposed_face_count(grid));

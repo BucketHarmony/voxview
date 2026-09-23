@@ -148,7 +148,7 @@ pub fn two_models_translated() -> DotVoxData {
 /// Palette indices used by [`material_blocks`], in the order the blocks are
 /// laid out along +X. All three are painted the same colour, so anything that
 /// tells them apart in a render came from the material and not the palette.
-pub const MATERIAL_INDICES: [u8; 3] = [100, 101, 102];
+pub const MATERIAL_INDICES: [u8; 4] = [100, 101, 102, 103];
 /// The colour all three blocks share.
 pub const MATERIAL_COLOR: Color = Color {
     r: 150,
@@ -157,7 +157,7 @@ pub const MATERIAL_COLOR: Color = Color {
     a: 255,
 };
 
-/// Three 4x4x4 blocks in a row: diffuse, emissive, metal.
+/// Four 4x4x4 blocks in a row: diffuse, emissive, metal, glass.
 ///
 /// The point of the fixture is the control. One colour across all three means
 /// a render that shows a difference can only have got it from the `MATL`
@@ -179,7 +179,7 @@ pub fn material_blocks() -> DotVoxData {
         }
     }
     let mut data = base(vec![Model {
-        size: Size { x: 14, y: 4, z: 4 },
+        size: Size { x: 19, y: 4, z: 4 },
         voxels,
     }]);
     for index in MATERIAL_INDICES {
@@ -195,6 +195,11 @@ pub fn material_blocks() -> DotVoxData {
         material(
             MATERIAL_INDICES[2] as u32 + 1,
             &[("_type", "_metal"), ("_metal", "1"), ("_rough", "0.2")],
+        ),
+        // _alpha is how much light gets through, so this is half opaque.
+        material(
+            MATERIAL_INDICES[3] as u32 + 1,
+            &[("_type", "_glass"), ("_alpha", "0.5"), ("_rough", "0.1")],
         ),
     ];
     data

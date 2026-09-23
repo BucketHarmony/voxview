@@ -78,6 +78,23 @@ impl Shot {
         worst
     }
 
+    /// Mean alpha of the pixels a vertical band actually covered, ignoring
+    /// the ones nothing drew on. `None` when the band is empty.
+    fn band_alpha(&self, from: u32, to: u32) -> Option<f32> {
+        let mut total = 0.0f32;
+        let mut count = 0usize;
+        for x in from..to.min(SIZE) {
+            for y in 0..SIZE {
+                let a = self.at(x, y)[3];
+                if a > 0 {
+                    total += a as f32;
+                    count += 1;
+                }
+            }
+        }
+        (count > 0).then(|| total / count as f32)
+    }
+
     /// Mean brightness of the opaque pixels in a vertical band of the frame,
     /// or `None` when the band is empty.
     fn band_brightness(&self, from: u32, to: u32) -> Option<f32> {
@@ -146,11 +163,16 @@ fn renderer_with(samples: u32) -> Option<Renderer> {
 fn shoot(renderer: &mut Renderer, data: &dot_vox::DotVoxData, name: &str) -> Shot {
     let dir = std::env::temp_dir().join(format!("voxview-render-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join(format!("{name}.vox"));
+    // Tests run in parallel and two of them may want the same fixture, so the
+    // file name has to be unique per call rather than per fixture: otherwise
+    // one test deletes the file the other is still reading.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("{name}-{serial}.vox"));
     std::fs::write(&path, fixtures::to_bytes(data)).expect("write fixture");
 
     let scene = loader::load_file(&path).expect("the fixture parses");
-    let meshes = mesh::mesh_models(&scene.models);
+    let meshes = mesh::mesh_models(&scene.models, &scene.materials);
     let pixels = renderer
         .thumbnail(&scene, &meshes, SIZE)
         .expect("the render succeeds");
@@ -355,19 +377,15 @@ fn an_emissive_material_lights_its_own_voxels() {
     };
     let shot = shoot(&mut renderer, &fixtures::material_blocks(), "materials");
 
-    // Three blocks of one colour in a row along +X, and the default thumbnail
+    // Four blocks of one colour in a row along +X, and the default thumbnail
     // camera looks at them from front-right, so they stay left-to-right on
-    // screen. Only the middle one is emissive.
-    let columns = shot.columns();
-    let first = columns.iter().position(|&on| on).expect("something drew");
-    let last = columns.iter().rposition(|&on| on).expect("something drew");
-    let width = (last - first + 1) as u32;
-    let third = width / 3;
+    // screen. Only the second is emissive.
+    let bands = material_bands(&shot);
     let diffuse = shot
-        .band_brightness(first as u32, first as u32 + third)
+        .band_brightness(bands[0].0, bands[0].1)
         .expect("the diffuse block drew");
     let emissive = shot
-        .band_brightness(first as u32 + third, first as u32 + 2 * third)
+        .band_brightness(bands[1].0, bands[1].1)
         .expect("the emissive block drew");
     eprintln!("brightness: diffuse {diffuse:.1}, emissive {emissive:.1}");
 
@@ -378,6 +396,48 @@ fn an_emissive_material_lights_its_own_voxels() {
         "an emissive block should be clearly brighter than an identically \
          coloured diffuse one ({emissive:.1} vs {diffuse:.1})"
     );
+}
+
+#[test]
+fn a_glass_material_lets_the_background_through() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let shot = shoot(&mut renderer, &fixtures::material_blocks(), "materials");
+
+    let bands = material_bands(&shot);
+    let diffuse = shot
+        .band_alpha(bands[0].0, bands[0].1)
+        .expect("the diffuse block drew");
+    let glass = shot
+        .band_alpha(bands[3].0, bands[3].1)
+        .expect("the glass block drew");
+    eprintln!("alpha: diffuse {diffuse:.1}, glass {glass:.1}");
+
+    // The thumbnail clears to transparent, so a blended face leaves its own
+    // opacity behind and an opaque one leaves 255. Anything less than opaque
+    // means the face went through the blended pass, which is the whole claim.
+    assert!(
+        diffuse > 250.0,
+        "a diffuse block should be fully opaque ({diffuse:.1})"
+    );
+    assert!(
+        glass < 200.0,
+        "a glass block should not be ({glass:.1} against {diffuse:.1})"
+    );
+}
+
+/// The four material blocks' horizontal extents, as pixel columns.
+///
+/// They are evenly spaced along +X and the camera keeps them left to right,
+/// so quartering what actually drew finds each one without having to project
+/// anything by hand.
+fn material_bands(shot: &Shot) -> [(u32, u32); 4] {
+    let columns = shot.columns();
+    let first = columns.iter().position(|&on| on).expect("something drew") as u32;
+    let last = columns.iter().rposition(|&on| on).expect("something drew") as u32;
+    let quarter = (last - first + 1) / 4;
+    std::array::from_fn(|i| (first + i as u32 * quarter, first + (i as u32 + 1) * quarter))
 }
 
 #[test]

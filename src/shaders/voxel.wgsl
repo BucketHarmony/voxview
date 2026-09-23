@@ -124,7 +124,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         color = mix(color, base * (1.0 + emit), clamp(emit, 0.0, 1.0));
     }
 
-    // Opaque geometry must write 1.0: the alpha channel is what makes a
-    // screenshot's background transparent.
-    return vec4<f32>(color, 1.0);
+    // Alpha is the material's opacity, which is 1.0 for everything but glass
+    // and fog. That doubles as what makes a screenshot's background
+    // transparent: the opaque pass does not blend, so it simply stores 1.0.
+    return vec4<f32>(color, material.w);
 }
