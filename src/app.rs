@@ -392,6 +392,17 @@ impl App {
                     self.lib = lib;
                     self.restore_collections();
                     self.sync_current();
+                    // A library named in Chinese or Hebrew needs a font egui
+                    // does not ship with. Ask now, while the names are in
+                    // hand, rather than when the first one is drawn.
+                    if let Some(ui) = &mut self.ui {
+                        for asset in &self.lib.assets {
+                            ui.may_show(&asset.name);
+                        }
+                        for folder in &self.lib.folders {
+                            ui.may_show(&folder.name);
+                        }
+                    }
                     touched = true;
                 }
                 scan::Msg::Stats { path, load } => {
@@ -769,6 +780,7 @@ impl App {
                 let chrome = if viewing {
                     Chrome::Viewer(ViewerChrome {
                         current: self.current,
+                        name: self.names.get(self.index).map_or("", String::as_str),
                         show_grid: self.show_grid,
                         show_bbox: self.show_bbox,
                         show_axes: self.show_axes,
@@ -967,7 +979,13 @@ impl ApplicationHandler for App {
                 return;
             }
         }
-        self.ui = Some(Ui::new(&window));
+        let mut ui = Ui::new(&window);
+        // The viewer's own file listing comes from the command line, not from
+        // the scan, so it gets asked separately.
+        for name in &self.names {
+            ui.may_show(name);
+        }
+        self.ui = Some(ui);
         self.window = Some(window);
         self.scan = Some(Scan::start(self.root.clone()));
         self.load(Framing::Reset);

@@ -20,6 +20,7 @@ pub mod palette;
 pub mod scan;
 pub mod scene;
 pub mod settings;
+pub mod sysfont;
 pub mod thumb;
 pub mod ui;
 pub mod watch;

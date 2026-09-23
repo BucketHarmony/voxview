@@ -11,6 +11,7 @@
 
 use crate::gfx::{Renderer, UiFrame};
 use crate::library::{self, Library, Load, Row, Scope, Sort, View, thousands};
+use crate::sysfont;
 use crate::thumb::Thumbs;
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 use std::path::PathBuf;
@@ -76,6 +77,9 @@ pub struct ScanStatus {
 /// The viewer's state, for the overlay drawn on top of the model.
 pub struct ViewerChrome<'a> {
     pub current: Option<usize>,
+    /// The file on screen. Drawn here as well as in the HUD, because the HUD's
+    /// bitmap font is ASCII and a name in another script reaches it as `?`.
+    pub name: &'a str,
     pub show_grid: bool,
     pub show_bbox: bool,
     pub show_axes: bool,
@@ -107,6 +111,14 @@ pub struct Ui {
     prompt: bool,
     /// Collected during a frame, returned from [`Ui::frame`].
     actions: Vec<Action>,
+    /// Scripts seen in names that the bundled font cannot draw, and not yet
+    /// answered with a system font.
+    wanted_scripts: sysfont::Scripts,
+    /// Scripts a font has already been looked for, so each is looked for once.
+    loaded_scripts: sysfont::Scripts,
+    /// The fallback fonts in use, kept because egui's font definitions are
+    /// replaced wholesale and every one has to be listed each time.
+    loaded_fonts: Vec<(String, std::sync::Arc<egui::FontData>)>,
 }
 
 impl Ui {
@@ -136,7 +148,91 @@ impl Ui {
             peek: false,
             prompt: false,
             actions: Vec::new(),
+            wanted_scripts: sysfont::Scripts::default(),
+            loaded_scripts: sysfont::Scripts::default(),
+            loaded_fonts: Vec::new(),
         }
+    }
+
+    /// Note that `text` is about to be shown, so fonts that can draw it are
+    /// found before it is.
+    ///
+    /// Cheap enough to call on every file name in a scan: for an ASCII name it
+    /// is one range check per character with no allocation, and the answer is
+    /// folded into a bitset.
+    pub fn may_show(&mut self, text: &str) {
+        let scripts = sysfont::scripts_beyond(text);
+        if scripts.is_empty() {
+            return;
+        }
+        for script in scripts.iter() {
+            if !self.loaded_scripts.contains(script) {
+                self.wanted_scripts.insert(script);
+            }
+        }
+    }
+
+    /// Fold any system fallback fonts into egui's font list.
+    ///
+    /// Called at the top of a frame rather than from [`Ui::may_show`], because
+    /// reading twenty megabytes of font is not something to do in the middle
+    /// of a scan drain, and because a whole scan's worth of names may ask for
+    /// fonts before the first frame that needs one.
+    fn load_fallback(&mut self) {
+        let wanted = std::mem::take(&mut self.wanted_scripts);
+        if wanted.is_empty() {
+            return;
+        }
+        // Marked as done whether or not a font turned up: a script with no
+        // font on this machine has no font on the next frame either, and
+        // re-reading the directories every frame would be worse than boxes.
+        self.loaded_scripts = self.loaded_scripts.union(wanted);
+
+        let fonts = sysfont::fallbacks(wanted);
+        if fonts.is_empty() {
+            let names: Vec<String> = wanted.iter().map(|s| format!("{s:?}")).collect();
+            eprintln!(
+                "voxview: some names need {}, which the built-in font cannot draw, \
+                 and no system font was found to fall back to; they will appear as boxes",
+                names.join(", ")
+            );
+            return;
+        }
+        for font in fonts {
+            println!(
+                "voxview: using {} for text the built-in font cannot draw",
+                font.name
+            );
+            self.loaded_fonts.push((
+                font.name,
+                std::sync::Arc::new(egui::FontData {
+                    font: font.bytes.into(),
+                    index: font.index,
+                    tweak: egui::FontTweak::default(),
+                }),
+            ));
+        }
+
+        // Rebuilt from the defaults and re-applied whole: egui's font
+        // definitions are a complete state, not something to append to, so
+        // fonts loaded on an earlier frame are listed again. They are shared
+        // by `Arc`, so this re-lists them without re-reading them.
+        let mut definitions = egui::FontDefinitions::default();
+        for (name, data) in &self.loaded_fonts {
+            definitions.font_data.insert(name.clone(), data.clone());
+            // Appended, not prepended: the bundled font stays in charge of
+            // Latin, so the interface does not change shape on a machine that
+            // happens to have a different font installed. egui only consults
+            // the next entry for a glyph the previous one lacks.
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                definitions
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+        self.ctx.set_fonts(definitions);
     }
 
     /// Feed a window event to egui. Returns true when egui used it, so the
@@ -196,6 +292,7 @@ impl Ui {
         lib: &mut Library,
         chrome: Chrome,
     ) -> (UiFrame, Vec<Action>) {
+        self.load_fallback();
         self.thumbs.pump(&self.ctx, renderer);
         self.actions.clear();
 
@@ -1333,14 +1430,21 @@ impl Ui {
             .anchor(egui::Align2::RIGHT_TOP, vec2(-12.0, 12.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if let Some(asset) = chrome.current {
-                        ui.label(
-                            egui::RichText::new(lib.relative(asset))
-                                .monospace()
-                                .size(11.0)
-                                .color(DIM),
-                        );
-                    }
+                    // `relative` is the folder, which is empty for a file
+                    // sitting directly in the browsed root, so the name does
+                    // the work and the folder is a prefix when there is one.
+                    let folder = chrome.current.map(|a| lib.relative(a)).unwrap_or_default();
+                    let where_it_is = if folder.is_empty() {
+                        chrome.name.to_owned()
+                    } else {
+                        format!("{folder}/{}", chrome.name)
+                    };
+                    ui.label(
+                        egui::RichText::new(where_it_is)
+                            .monospace()
+                            .size(11.0)
+                            .color(DIM),
+                    );
                     if ui.button("Library  Esc").clicked() {
                         self.actions.push(Action::ToLibrary);
                     }
