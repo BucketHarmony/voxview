@@ -12,6 +12,7 @@ pub mod gfx;
 pub mod hud;
 pub mod library;
 pub mod loader;
+pub mod material;
 pub mod menu;
 pub mod mesh;
 pub mod model;

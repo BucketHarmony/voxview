@@ -93,8 +93,9 @@ fn print_stats(path: &std::path::Path, scene: &loader::VoxScene) {
         }
     );
     println!(
-        "  materials     {} (read, not rendered)",
-        scene.material_count
+        "  materials     {}{}",
+        scene.material_count,
+        describe_materials(&scene.materials)
     );
     for (i, m) in scene.models.iter().enumerate() {
         let s = m.size();
@@ -105,5 +106,26 @@ fn print_stats(path: &std::path::Path, scene: &loader::VoxScene) {
             s.z,
             m.voxel_count()
         );
+    }
+}
+
+/// The part of a material table worth putting in one line: not how many
+/// `MATL` chunks a file has -- MagicaVoxel writes 256 whether they say
+/// anything or not -- but how many of them this renderer will act on.
+fn describe_materials(materials: &voxview::material::Materials) -> String {
+    let parts = [
+        (materials.emissive_count(), "emissive"),
+        (materials.metal_count(), "metal"),
+        (materials.transparent_count(), "transparent"),
+    ];
+    let listed: Vec<String> = parts
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, name)| format!("{n} {name}"))
+        .collect();
+    if listed.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", listed.join(", "))
     }
 }

@@ -1,5 +1,6 @@
 //! Turning bytes on disk into something the renderer can chew on.
 
+use crate::material::Materials;
 use crate::model::VoxelGrid;
 use crate::palette::Palette;
 use crate::scene::{Bounds, ModelInstance, flatten};
@@ -21,8 +22,11 @@ pub struct VoxScene {
     /// False when the file carried no `RGBA` chunk and the MagicaVoxel
     /// default was substituted. The library's palette facet reports it.
     pub palette_from_file: bool,
-    /// Number of `MATL` chunks; read but not rendered in v1.
+    /// Number of `MATL` chunks in the file, whether or not any of them said
+    /// anything this renderer can show.
     pub material_count: usize,
+    /// Surface properties per palette index, from those chunks.
+    pub materials: Materials,
     /// Total occupied cells across every *instanced* model.
     pub voxel_count: usize,
     /// World-space bounds of all instances, in voxel units.
@@ -96,6 +100,7 @@ pub fn load_bytes(bytes: &[u8]) -> Result<VoxScene> {
         palette,
         palette_from_file,
         material_count: parsed.materials.len(),
+        materials: Materials::from_dot_vox(&parsed.materials),
         voxel_count,
         bounds: bounds.unwrap_or_default(),
     })

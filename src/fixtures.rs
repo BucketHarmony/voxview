@@ -7,8 +7,8 @@
 
 use crate::scene::frame_dict;
 use dot_vox::{
-    Color, DEFAULT_PALETTE, Dict, DotVoxData, Frame, Layer, Model, SceneNode, ShapeModel, Size,
-    Voxel,
+    Color, DEFAULT_PALETTE, Dict, DotVoxData, Frame, Layer, Material, Model, SceneNode, ShapeModel,
+    Size, Voxel,
 };
 use glam::IVec3;
 use std::path::Path;
@@ -21,6 +21,7 @@ pub const FIXTURES: &[Fixture] = &[
     ("cube.vox", single_cube),
     ("checker.vox", checkerboard_8),
     ("two_models.vox", two_models_translated),
+    ("materials.vox", material_blocks),
 ];
 
 /// Write every fixture into `dir`, creating it if needed.
@@ -142,6 +143,71 @@ pub fn two_models_translated() -> DotVoxData {
         attributes: Dict::new(),
     }];
     data
+}
+
+/// Palette indices used by [`material_blocks`], in the order the blocks are
+/// laid out along +X. All three are painted the same colour, so anything that
+/// tells them apart in a render came from the material and not the palette.
+pub const MATERIAL_INDICES: [u8; 3] = [100, 101, 102];
+/// The colour all three blocks share.
+pub const MATERIAL_COLOR: Color = Color {
+    r: 150,
+    g: 150,
+    b: 160,
+    a: 255,
+};
+
+/// Three 4x4x4 blocks in a row: diffuse, emissive, metal.
+///
+/// The point of the fixture is the control. One colour across all three means
+/// a render that shows a difference can only have got it from the `MATL`
+/// chunks, which is the thing worth asserting.
+pub fn material_blocks() -> DotVoxData {
+    let mut voxels = Vec::new();
+    for (block, index) in MATERIAL_INDICES.iter().enumerate() {
+        for z in 0..4u8 {
+            for y in 0..4u8 {
+                for x in 0..4u8 {
+                    voxels.push(Voxel {
+                        x: x + block as u8 * 5,
+                        y,
+                        z,
+                        i: *index,
+                    });
+                }
+            }
+        }
+    }
+    let mut data = base(vec![Model {
+        size: Size { x: 14, y: 4, z: 4 },
+        voxels,
+    }]);
+    for index in MATERIAL_INDICES {
+        data.palette[index as usize] = MATERIAL_COLOR;
+    }
+    // Ids run one ahead of the palette index, the way MagicaVoxel writes them.
+    data.materials = vec![
+        material(MATERIAL_INDICES[0] as u32 + 1, &[("_type", "_diffuse")]),
+        material(
+            MATERIAL_INDICES[1] as u32 + 1,
+            &[("_type", "_emit"), ("_emit", "1"), ("_flux", "1")],
+        ),
+        material(
+            MATERIAL_INDICES[2] as u32 + 1,
+            &[("_type", "_metal"), ("_metal", "1"), ("_rough", "0.2")],
+        ),
+    ];
+    data
+}
+
+fn material(id: u32, props: &[(&str, &str)]) -> Material {
+    Material {
+        id,
+        properties: props
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+    }
 }
 
 fn named(name: &str) -> Dict {

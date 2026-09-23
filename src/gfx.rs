@@ -90,6 +90,7 @@ struct Globals {
     light_dir: [f32; 4],
     params: [f32; 4],
     viewport: [f32; 4],
+    eye: [f32; 4],
 }
 
 /// Direction the key light travels, in world space (Z up).
@@ -178,6 +179,7 @@ pub struct Renderer {
 
     globals_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
+    material_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     globals_layout: wgpu::BindGroupLayout,
     model_layout: wgpu::BindGroupLayout,
@@ -197,9 +199,10 @@ pub struct Renderer {
 
     scene: Option<GpuScene>,
     overlays: Option<GpuOverlays>,
-    /// The viewer's palette, kept so a thumbnail render can borrow the shared
-    /// palette buffer and hand it back untouched.
+    /// The viewer's palette and materials, kept so a thumbnail render can
+    /// borrow the shared buffers and hand them back untouched.
     palette_linear: [[f32; 4]; 256],
+    materials_gpu: [[f32; 4]; 256],
     /// Depth and multisample attachments for off-screen thumbnails, sized on
     /// first use and kept for the rest of the folder.
     thumb_targets: Option<ThumbTargets>,
@@ -308,12 +311,19 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let material_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("materials"),
+            size: 256 * 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals layout"),
             entries: &[
                 uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, false, None),
-                uniform_entry(1, wgpu::ShaderStages::VERTEX, false, None),
+                uniform_entry(1, wgpu::ShaderStages::FRAGMENT, false, None),
+                uniform_entry(2, wgpu::ShaderStages::FRAGMENT, false, None),
             ],
         });
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -327,6 +337,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: palette_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: material_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -397,6 +411,7 @@ impl Renderer {
             depth_view,
             globals_buffer,
             palette_buffer,
+            material_buffer,
             globals_bind_group,
             globals_layout,
             model_layout,
@@ -411,6 +426,7 @@ impl Renderer {
             scene: None,
             overlays: None,
             palette_linear: [[0.0; 4]; 256],
+            materials_gpu: [[0.0; 4]; 256],
             thumb_targets: None,
             egui,
             hud_vertices,
@@ -519,10 +535,16 @@ impl Renderer {
     /// depends on that.
     pub fn set_scene(&mut self, scene: &VoxScene, meshes: &[Mesh]) {
         self.palette_linear = scene.palette.to_linear_rgba();
+        self.materials_gpu = scene.materials.to_gpu();
         self.queue.write_buffer(
             &self.palette_buffer,
             0,
             bytemuck::cast_slice(&self.palette_linear),
+        );
+        self.queue.write_buffer(
+            &self.material_buffer,
+            0,
+            bytemuck::cast_slice(&self.materials_gpu),
         );
 
         let ranges = overlay::build(&scene.bounds);
@@ -804,6 +826,11 @@ impl Renderer {
             0,
             bytemuck::cast_slice(&scene.palette.to_linear_rgba()),
         );
+        self.queue.write_buffer(
+            &self.material_buffer,
+            0,
+            bytemuck::cast_slice(&scene.materials.to_gpu()),
+        );
 
         let mut camera = OrbitCamera::default();
         camera.reset(&scene.bounds);
@@ -812,6 +839,7 @@ impl Renderer {
             light_dir: LIGHT_DIR.normalize().extend(0.0).to_array(),
             params: [AMBIENT, 1.0, 0.0, 0.0],
             viewport: [size as f32, size as f32, 0.0, 0.0],
+            eye: camera.eye().extend(1.0).to_array(),
         };
         self.queue
             .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
@@ -897,6 +925,11 @@ impl Renderer {
             0,
             bytemuck::cast_slice(&self.palette_linear),
         );
+        self.queue.write_buffer(
+            &self.material_buffer,
+            0,
+            bytemuck::cast_slice(&self.materials_gpu),
+        );
         pixels
     }
 
@@ -970,6 +1003,7 @@ impl Renderer {
                 0.0,
                 0.0,
             ],
+            eye: params.camera.eye().extend(1.0).to_array(),
         };
         self.queue
             .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));

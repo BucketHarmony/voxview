@@ -78,6 +78,23 @@ impl Shot {
         worst
     }
 
+    /// Mean brightness of the opaque pixels in a vertical band of the frame,
+    /// or `None` when the band is empty.
+    fn band_brightness(&self, from: u32, to: u32) -> Option<f32> {
+        let mut total = 0.0f32;
+        let mut count = 0usize;
+        for x in from..to.min(SIZE) {
+            for y in 0..SIZE {
+                let p = self.at(x, y);
+                if p[3] > 200 {
+                    total += (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0;
+                    count += 1;
+                }
+            }
+        }
+        (count > 0).then(|| total / count as f32)
+    }
+
     /// Column occupancy, for asking whether geometry landed in two clumps.
     fn columns(&self) -> Vec<bool> {
         (0..SIZE)
@@ -328,6 +345,38 @@ fn multisampling_softens_the_edges_of_the_model() {
     assert!(
         (a - b).abs() < 0.02,
         "coverage moved from {a:.3} to {b:.3}; that is more than an edge"
+    );
+}
+
+#[test]
+fn an_emissive_material_lights_its_own_voxels() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let shot = shoot(&mut renderer, &fixtures::material_blocks(), "materials");
+
+    // Three blocks of one colour in a row along +X, and the default thumbnail
+    // camera looks at them from front-right, so they stay left-to-right on
+    // screen. Only the middle one is emissive.
+    let columns = shot.columns();
+    let first = columns.iter().position(|&on| on).expect("something drew");
+    let last = columns.iter().rposition(|&on| on).expect("something drew");
+    let width = (last - first + 1) as u32;
+    let third = width / 3;
+    let diffuse = shot
+        .band_brightness(first as u32, first as u32 + third)
+        .expect("the diffuse block drew");
+    let emissive = shot
+        .band_brightness(first as u32 + third, first as u32 + 2 * third)
+        .expect("the emissive block drew");
+    eprintln!("brightness: diffuse {diffuse:.1}, emissive {emissive:.1}");
+
+    // Same palette colour, same light, same angles: the only thing that can
+    // separate them is the MATL chunk.
+    assert!(
+        emissive > diffuse * 1.2,
+        "an emissive block should be clearly brighter than an identically \
+         coloured diffuse one ({emissive:.1} vs {diffuse:.1})"
     );
 }
 
