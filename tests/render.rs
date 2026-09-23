@@ -33,7 +33,13 @@ impl Shot {
 
     /// Fraction of the frame the model covers, 0.0 to 1.0.
     fn coverage(&self) -> f32 {
-        let lit = self.pixels.chunks_exact(4).filter(|p| p[3] > 8).count();
+        let lit = self
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[3] > 8)
+            .count();
         lit as f32 / (SIZE * SIZE) as f32
     }
 
@@ -47,7 +53,9 @@ impl Shot {
     fn chromatic_spread(&self) -> f32 {
         let hues: Vec<[f32; 3]> = self
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[3] > 200)
             .filter_map(|p| {
                 let sum = p[0] as f32 + p[1] as f32 + p[2] as f32;
@@ -171,7 +179,9 @@ fn a_cube_renders_framed_and_in_its_own_colour() {
     // the tolerance is wide; what is being tested is hue, not exposure.
     let lit = shot
         .pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[3] > 200)
         .max_by_key(|p| p[0] as u32 + p[1] as u32 + p[2] as u32)
         .expect("something is lit");
