@@ -1,5 +1,7 @@
 # voxview
 
+[![CI](https://github.com/BucketHarmony/voxview/actions/workflows/ci.yml/badge.svg)](https://github.com/BucketHarmony/voxview/actions/workflows/ci.yml)
+
 A standalone viewer and browser for MagicaVoxel `.vox` files. It opens any file
 MagicaVoxel writes, renders it with the file's own palette, and reloads when the
 file changes on disk — which is the point: it is meant to sit on a second
@@ -49,7 +51,15 @@ when it is done. Thumbnails are rendered on the GPU, only for the cells you can
 actually see, and cached between runs under `%LOCALAPPDATA%\voxview\thumbnails`
 (Windows) or `~/.cache/voxview/thumbnails` (Linux, or `$XDG_CACHE_HOME`). The
 cache key includes the file's size and modification time, so an edited model
-re-renders on its own.
+re-renders on its own. The cache is capped at 256 MB and trimmed
+least-recently-used on startup, in the background, so browsing a very large tree
+cannot quietly eat a disk.
+
+File names in Chinese, Japanese, Korean, Arabic, Hebrew, Thai or an Indic script
+draw properly. The font egui bundles covers Latin, Greek and Cyrillic and stops
+there, so anything outside that borrows a font already installed on the machine,
+loaded on demand and only for the scripts actually present — an ASCII-named
+library pays nothing for the feature.
 
 Down the left is the folder tree with a count beside each folder, then
 collections, then the filter facets — extent, palette source, and state
@@ -67,7 +77,8 @@ folds `name-1.vox`, `name-2.vox` and friends into one cell with a `×n` badge;
 click the badge to open the stack, or press `S` to stop folding.
 
 Collections cut across folders: select some assets, press `C`, name the
-collection. They live for the run only — v1 does not write them to disk.
+collection. They are saved with the rest of the settings and restored by path
+when the next scan finds those files again.
 
 ## Keys
 
@@ -98,10 +109,13 @@ collection. They live for the run only — v1 does not write them to disk.
 | Scroll | Zoom |
 | `F` | Frame the model, keeping the current angle |
 | `Home` | Reset the camera to the default angle and framing |
+| `1`, `3`, `7` | Look along front, right, top; with `Ctrl`, the opposite side |
+| `5` | Switch between orthographic and perspective |
 | `G` | Ground grid at z = 0 |
 | `B` | Bounding box |
 | `A` | Axis gizmo (X red, Y green, Z blue) |
 | `O` | Ambient occlusion |
+| `S` | Cycle multisampling: off, 2×, 4×, 8× |
 | `T` | Toggle the dark and light background |
 | `P` | Save a PNG next to the model |
 | `[`, `]` | Previous, next asset |
@@ -127,8 +141,51 @@ overlays — so it drops straight into a contact sheet or a wiki page. `P` in th
 library does the same for every selected asset at 512×512, which is how you get
 a sheet of a hundred sprites without opening any of them.
 
+The number keys are Blender's, including `Ctrl` for the opposite side, because
+anyone who has spent a day in a voxel pipeline already has them in their
+fingers. The numpad works too, and so do the digits along the top for the
+laptops that do not have a numpad.
+
 Coordinates are right-handed with **Z up**, matching MagicaVoxel and Veloren:
 a model's up in the editor is its up here.
+
+## What it remembers
+
+Window size, position and maximised state; the overlay toggles, the background,
+the antialiasing and the projection; how the library was last sorted, viewed and
+sized; the directory it was last pointed at, which is what it reopens when
+started with no argument; and your collections.
+
+The file is line-based `key = value` text, at
+`%APPDATA%\voxview\settings.txt` (Windows) or `~/.config/voxview/settings.txt`
+(Linux, or `$XDG_CONFIG_HOME`). It is meant to be opened and fixed by hand:
+unknown keys are ignored and a malformed value falls back to the default, so a
+file from a newer version, or a bad edit, degrades rather than failing.
+
+## Materials
+
+`MATL` chunks are read into a 256-entry table alongside the palette and reach
+the fragment shader as a second uniform, so the three things that change what a
+model looks like across a room survive:
+
+* **`_emit`** glows, at `_emit × (_flux + 1)`, clipping towards white in place
+  of the bloom a display without high dynamic range cannot give it.
+* **`_metal`** takes a per-fragment Blinn-Phong highlight whose tightness comes
+  from `_rough`, tinted towards the surface's own colour the way a metal tints
+  its reflections. Per fragment matters here: greedy meshing merges a flat wall
+  into one enormous quad, and a highlight interpolated across that is a smear.
+* **`_glass`** and **`_media`** are drawn in a second, blended pass that tests
+  depth without writing it.
+
+MagicaVoxel is a path tracer and this is not, so the rest — index of refraction,
+scattering, subsurface density, `rOBJ` render settings — is parsed and ignored.
+`--stats` says what a file actually carries: `materials 256 (9 emissive, 7
+metal, 4 transparent)`.
+
+The blended pass does not sort. Glass in front of opaque geometry is correct;
+glass in front of other glass blends in mesh order. Sorting every quad against
+the camera on every frame costs more than a preview is worth, and back-face
+culling already keeps a single pane honest.
 
 ## The two design decisions
 
@@ -180,8 +237,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The three fixtures under `tests/fixtures/` — a solid cube, an 8³ checkerboard
-and a two-model scene with translations — are written from code by
+The four fixtures under `tests/fixtures/` — a solid cube, an 8³ checkerboard,
+a two-model scene with translations, and a row of identically coloured blocks
+that differ only in their materials — are written from code by
 `voxview::fixtures` and rewritten by the test run, so nothing here needs
 MagicaVoxel installed. `cargo test --release` additionally asserts the meshing
 budget: a 126³ model in under 200 ms.
@@ -194,10 +252,8 @@ scan.
 
 ## Not in v1
 
-No editing, painting, export to other formats, materials or emissives, and no
-animation. `MATL` chunks are parsed and counted in the HUD but do not affect
-shading; `rOBJ` and `rCAM` are parsed and ignored. Collections are not saved
-between runs.
+No editing, painting, export to other formats, and no animation. `rOBJ` and
+`rCAM` are parsed and ignored.
 
 Two extension points are marked in the source with `// EXTENSION:`: loading
 Veloren RON manifests, which describe multi-part assemblies with per-part
@@ -219,6 +275,7 @@ matters, why it is shaped the way it is. The short version:
 | `model` | `VoxelGrid` — the dense occupancy grid a model becomes |
 | `mesh` | Greedy meshing and the per-face occlusion term |
 | `palette` | 256 colours, padded from MagicaVoxel's default, plus the remap extension point |
+| `material` | `MATL` chunks, turned into the 256-entry table the shader indexes |
 | `gfx` | wgpu: pipelines, buffers, the render pass, off-screen thumbnails and screenshots |
 | `camera` | The orbit camera, framing and reset |
 | `overlay`, `hud`, `font` | Grid, bounding box, axes, and the bitmap-font HUD |
@@ -226,8 +283,10 @@ matters, why it is shaped the way it is. The short version:
 | `scan` | The background walk that feeds the library |
 | `thumb` | Thumbnail rendering and the on-disk cache |
 | `ui` | The egui layer — presentation only; clicks come back as an `Action` |
+| `settings` | What survives between runs, and the hand-editable file it lives in |
+| `sysfont` | Finding a system font when a file name is outside what egui bundles |
 | `watch`, `menu`, `app` | The file watcher, the text file menu, and the event loop that ties it together |
-| `fixtures` | The three test `.vox` files, written from code so no editor is needed |
+| `fixtures` | The four test `.vox` files, written from code so no editor is needed |
 
 `NOTES.md` is the other half of the documentation, and the more useful half if
 you are about to touch the parser: it records what the `.vox` format and

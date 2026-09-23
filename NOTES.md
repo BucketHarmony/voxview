@@ -88,18 +88,83 @@ animation on top of itself; the viewer draws the first and ignores the rest.
 Nothing in the format prevents it, and a corrupt file will do it. `flatten`
 carries both a depth limit and a visiting set.
 
+## `MATL` ids are 1-based, and nothing says so
+
+A material's id is the palette index *plus one*, so the table lookup is
+`id - 1`. The specification does not mention it. Neither do the sample models
+ephtracy ships, because none of them carries a single `MATL` chunk. The one
+other reader consulted zips the material list against the palette positionally,
+which is right only when a file happens to carry all 256 in order.
+
+The way to settle it is to dump a file MagicaVoxel wrote: its ids run 1 to 256,
+and an id of 256 cannot be a palette index. `material::zero_based` therefore
+asks the file which convention it used — an id of 0 can only come from a writer
+that numbered from zero, an id of 256 only from one that numbered from one —
+and falls back to MagicaVoxel's.
+
+## `MATL` dictionaries keep values the current `_type` does not use
+
+Move the metalness slider, then switch the material to `_emit`, and the file
+still carries `_metal: 0.77`. The editor keeps the value so that switching back
+restores it; nothing marks it inactive.
+
+Reading every key that is present therefore produces glowing chrome. Every
+property has to be read *conditioned on `_type`*: `_emit` and `_flux` only for
+`_emit`, `_metal` only for `_metal`, and so on. `study.vox` has a material that
+demonstrates both halves of this — id 187 is `_emit` with no `_emit` key at all,
+so it is correctly not emissive, while others carry metalness they do not use.
+
+## `_alpha` is transparency, not coverage
+
+On a `_glass` material `_alpha` is how much light gets *through*, so the opacity
+a rasteriser wants is `1 - _alpha`. Reading it as coverage inverts every window
+in a model: the solid ones vanish and the clear ones go opaque. `dot_vox` calls
+the accessor `opacity()`, which does not help.
+
+`_trans` (`Material::transparency()`) is the same quantity under the physical
+name and is accepted as a fallback.
+
+## Emission is `_emit × (_flux + 1)`
+
+`_flux` is an integer exposure step, not a multiplier, and a material with
+`_emit` set and no `_flux` is not dark. Both are clamped before use: a file is
+free to say `_flux: 1e30`.
+
+## The official sample models exercise almost nothing
+
+The ten `.vox` files ephtracy distributes have no `MATL` chunks and no scene
+graph at all — every one is a bare `SIZE`/`XYZI`/`RGBA` triple. A viewer tested
+only against them has tested neither materials nor `nTRN`. Files written by
+recent MagicaVoxel versions, and by other editors, are where the coverage is.
+
 ---
 
 ## Not a format problem, but worth writing down
 
-* **No MSAA in v1.** Voxel silhouettes are all axis-aligned, so the aliasing is
-  mild, and a 4× multisampled target costs real bandwidth on the integrated
-  GPUs this targets. It is a one-line change to `MultisampleState` plus a
-  resolve target if it turns out to be wanted.
+* **`adapter.get_texture_format_features` promises more than the device
+  delivers.** It reports what the hardware can do, which on a desktop card
+  includes 8× multisampling. WebGPU only guarantees sample counts 1 and 4, and
+  wgpu will reject anything else unless the device was created with
+  `Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` — as a validation panic,
+  not a fallback. So the feature is requested when the adapter offers it, and
+  counts outside {1, 4} are offered only when the *device* ended up with it.
+  Both the colour format and the depth format have to agree, and so does every
+  pipeline in the pass, which is why changing the setting rebuilds all four.
 
-* **The HUD font is embedded.** A 5×7 bitmap atlas in `src/font.rs` rather than
-  a font-rasteriser dependency, so there is no system font lookup to fail on a
-  bare Linux box and no extra crate in the tree.
+* **The HUD font is embedded, and is ASCII only.** A 5×7 bitmap atlas in
+  `src/font.rs` rather than a font-rasteriser dependency, so there is no system
+  font lookup to fail on a bare Linux box and no extra crate in the tree. The
+  atlas covers `0x20` to `0x7e` and nothing else, so the HUD substitutes for
+  anything outside that rather than drawing a blank. Non-Latin file names are
+  legible in the egui chrome — the title bar, the library captions, the
+  inspector — which is where they matter; the HUD is a debug overlay.
+
+* **Lighting is per fragment because meshing is greedy.** Everything else about
+  this renderer would be happy to shade per vertex, and the first version did.
+  A greedy quad can be the size of a wall, so a specular highlight computed at
+  its four corners and interpolated across it is a gradient, not a highlight.
+  Moving the whole calculation to the fragment stage is what makes `_metal`
+  look like metal, and it costs nothing measurable at these triangle counts.
 
 * **The file watcher watches the directory, not the file.** MagicaVoxel and most
   exporters save by writing a temporary file and renaming it into place. That
@@ -153,6 +218,24 @@ carries both a depth limit and a visiting set.
   thumbnail placeholder and the failure marker are painted with `Painter::add`,
   and the rest are words ("Grid", "List", "asc"). `≤`, `×` and `…` do render, so
   the facet labels and the stack badge keep theirs.
+
+* **egui bundles a font for Latin, Greek and Cyrillic, and no more.** A file
+  called `橡木桶.vox` draws as a row of hollow boxes, silently, because a
+  missing glyph is not an error — a program that is confident and wrong.
+  Bundling coverage for CJK, Arabic, Hebrew, Thai and the Indic scripts would
+  add tens of megabytes to the binary for something most people never need, so
+  `src/sysfont.rs` finds fonts already installed instead: any machine whose file
+  manager can show those names has them. Nothing is loaded until a name needs
+  it, and what is loaded is chosen by script, so a folder of Hebrew names does
+  not drag in a Chinese font.
+
+  Two things about that are easy to get wrong. Most of the system fonts worth
+  having are `.ttc` collections rather than `.ttf`, and a collection holds
+  several faces — `egui::FontData` has an `index` field for exactly this, and
+  omitting it silently picks face 0, which for `Nirmala.ttc` is not the one you
+  want. And Windows keeps Thai in `LeelawUI.ttf` but Devanagari, Tamil, Telugu
+  and the rest of the Indic scripts in a single `Nirmala.ttc`, so the mapping
+  from script to file is not one per language.
 
 * **egui's clipboard and link features are deliberately off.** They pull in
   `arboard` and `webbrowser`, which want X11 or Wayland clipboard plumbing and a
