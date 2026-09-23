@@ -4,10 +4,11 @@
 //! Everything else lives in the library half of the crate, which is where the
 //! documentation is.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use voxview::loader;
+use voxview::settings::{self, Settings};
 
 /// A viewer and browser for MagicaVoxel `.vox` files.
 #[derive(Parser, Debug)]
@@ -41,20 +42,33 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let path = args
-        .path
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("a .vox file or directory is required"))?;
-    let (paths, index) = loader::collect_vox_paths(path)?;
+    // `--stats` is a command-line tool and has nothing to remember, so it
+    // never touches the settings file.
     if args.stats {
+        let path = args.path.as_deref().context("--stats needs a path")?;
+        let (paths, index) = loader::collect_vox_paths(path)?;
         let scene = loader::load_file(&paths[index])?;
         print_stats(&paths[index], &scene);
         return Ok(());
     }
+
+    let settings = Settings::load();
+    // With no argument, reopen the directory the library was last pointed at.
+    // That is what every other browser does, and it turns voxview into
+    // something you can pin to a taskbar.
+    let path = match args.path.as_deref() {
+        Some(path) => path.to_path_buf(),
+        None => settings
+            .root
+            .clone()
+            .filter(|root| settings::usable_root(root))
+            .ok_or_else(|| anyhow::anyhow!("a .vox file or directory is required"))?,
+    };
+    let (paths, index) = loader::collect_vox_paths(&path)?;
     // A directory argument means "show me what is here", so it opens the
     // library; naming one file means "show me this", so it opens the viewer.
     let browse = path.is_dir();
-    voxview::app::run(loader::browse_root(path), paths, index, browse)
+    voxview::app::run(loader::browse_root(&path), paths, index, browse, settings)
 }
 
 fn print_stats(path: &std::path::Path, scene: &loader::VoxScene) {

@@ -8,6 +8,7 @@ use crate::loader::{self, VoxScene};
 use crate::menu::{Hit, Menu};
 use crate::mesh;
 use crate::scan::{self, Scan};
+use crate::settings::Settings;
 use crate::ui::{Action, Chrome, ScanStatus, Toggle, Ui, ViewerChrome};
 use crate::watch::FileWatcher;
 use anyhow::{Context, Result};
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -25,13 +26,19 @@ use winit::window::{Window, WindowId};
 ///
 /// A directory argument opens the library; a file argument opens that file
 /// and leaves the library a keystroke away.
-pub fn run(root: PathBuf, paths: Vec<PathBuf>, index: usize, browse: bool) -> Result<()> {
+pub fn run(
+    root: PathBuf,
+    paths: Vec<PathBuf>,
+    index: usize,
+    browse: bool,
+    settings: Settings,
+) -> Result<()> {
     let event_loop = EventLoop::new().context("could not create an event loop")?;
     // Redraw continuously: the swapchain is in Fifo mode, so this paces
     // itself at the display's refresh rate rather than spinning.
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(root, paths, index, browse);
+    let mut app = App::new(root, paths, index, browse, settings);
     event_loop.run_app(&mut app).context("the viewer stopped")?;
     match app.fatal.take() {
         Some(e) => Err(e),
@@ -172,6 +179,16 @@ struct App {
     status: Option<(String, Instant)>,
     /// An error that should make the process exit non-zero.
     fatal: Option<anyhow::Error>,
+
+    /// What was on disk at startup, and what gets written back on the way out.
+    ///
+    /// Only the parts that cannot be read back off the live state are kept
+    /// here -- window geometry is taken from the window itself at exit, and
+    /// the toggles from the fields above.
+    settings: Settings,
+    /// Collections from the settings file, waiting for a scan to resolve their
+    /// paths into asset indices. Taken once, on the first completed walk.
+    pending_collections: Vec<(String, Vec<PathBuf>)>,
 }
 
 /// How long a one-off message (a screenshot path, say) stays in the HUD.
@@ -183,7 +200,13 @@ const WHEEL_ROWS: usize = 3;
 const SHOT_SIZE: u32 = 512;
 
 impl App {
-    fn new(root: PathBuf, paths: Vec<PathBuf>, index: usize, browse: bool) -> App {
+    fn new(
+        root: PathBuf,
+        paths: Vec<PathBuf>,
+        index: usize,
+        browse: bool,
+        settings: Settings,
+    ) -> App {
         let names = paths.iter().map(|p| file_name(p)).collect();
         let title = paths
             .first()
@@ -191,9 +214,16 @@ impl App {
             .filter(|d| !d.as_os_str().is_empty())
             .map(file_name)
             .unwrap_or_else(|| ".".into());
+        let mut lib = Library::new(root.clone(), Vec::new());
+        lib.view = settings.view;
+        lib.sort = settings.sort;
+        lib.descending = settings.descending;
+        lib.stack_variants = settings.stack_variants;
+        lib.cell = settings.cell;
+
         App {
             mode: if browse { Mode::Library } else { Mode::Viewer },
-            lib: Library::new(root.clone(), Vec::new()),
+            lib,
             root,
             scan: None,
             found: 0,
@@ -211,17 +241,117 @@ impl App {
             camera: OrbitCamera::default(),
             info: None,
             error: None,
-            show_grid: true,
-            show_bbox: false,
-            show_axes: true,
-            ambient_occlusion: true,
-            background: Background::Dark,
+            show_grid: settings.grid,
+            show_bbox: settings.bbox,
+            show_axes: settings.axes,
+            ambient_occlusion: settings.occlusion,
+            background: settings.background,
             mouse: Mouse::default(),
             shift: false,
             ctrl: false,
             fps: Fps::new(),
             status: None,
             fatal: None,
+            pending_collections: settings.collections.clone(),
+            settings,
+        }
+    }
+
+    /// Fold the live state back into the settings and write them out.
+    ///
+    /// Called once, on the way out. A failure gets one line on stderr: there
+    /// is nothing left to do about it, and silence would leave "it keeps
+    /// forgetting my window size" with no explanation anywhere.
+    fn save_settings(&mut self) {
+        if let Some(window) = &self.window {
+            let scale = window.scale_factor();
+            let size = window.inner_size().to_logical::<f64>(scale);
+            self.settings.window.width = size.width.round().max(1.0) as u32;
+            self.settings.window.height = size.height.round().max(1.0) as u32;
+            self.settings.window.maximized = window.is_maximized();
+            // A maximized window's position is the compositor's business, not
+            // something to restore, so it is only recorded when it is real.
+            let placed = (!window.is_maximized())
+                .then(|| window.outer_position().ok())
+                .flatten();
+            if let Some(position) = placed {
+                let position = position.to_logical::<f64>(scale);
+                self.settings.window.x = Some(position.x.round() as i32);
+                self.settings.window.y = Some(position.y.round() as i32);
+            }
+        }
+
+        self.settings.background = self.background;
+        self.settings.grid = self.show_grid;
+        self.settings.bbox = self.show_bbox;
+        self.settings.axes = self.show_axes;
+        self.settings.occlusion = self.ambient_occlusion;
+        self.settings.view = self.lib.view;
+        self.settings.sort = self.lib.sort;
+        self.settings.descending = self.lib.descending;
+        self.settings.stack_variants = self.lib.stack_variants;
+        self.settings.cell = self.lib.cell;
+        self.settings.root = Some(self.root.clone());
+
+        // Collections are stored by path, because an asset index only means
+        // something relative to the scan that produced it. If the scan never
+        // finished, the ones loaded at startup are written back untouched
+        // rather than thrown away.
+        self.settings.collections = if self.lib.assets.is_empty() {
+            std::mem::take(&mut self.pending_collections)
+        } else {
+            self.lib
+                .collections
+                .iter()
+                .map(|c| {
+                    let members = c
+                        .members
+                        .iter()
+                        .filter_map(|i| self.lib.assets.get(*i))
+                        .map(|a| a.path.clone())
+                        .collect();
+                    (c.name.clone(), members)
+                })
+                .collect()
+        };
+
+        if let Err(e) = self.settings.save() {
+            eprintln!("voxview: could not save settings: {e}");
+        }
+    }
+
+    /// Turn the saved collection paths into memberships in the library that
+    /// has just been scanned.
+    ///
+    /// Paths that are no longer on disk simply drop out; a collection that
+    /// loses every member is still kept, because an empty collection you made
+    /// on purpose is not the same thing as one that never existed.
+    fn restore_collections(&mut self) {
+        if self.pending_collections.is_empty() {
+            return;
+        }
+        let index: std::collections::HashMap<&Path, usize> = self
+            .lib
+            .assets
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.path.as_path(), i))
+            .collect();
+        let saved: Vec<(String, Vec<usize>)> = self
+            .pending_collections
+            .iter()
+            .map(|(name, paths)| {
+                let members = paths
+                    .iter()
+                    .filter_map(|p| index.get(p.as_path()).copied())
+                    .collect();
+                (name.clone(), members)
+            })
+            .collect();
+        self.pending_collections.clear();
+        for (name, members) in saved {
+            let set = self.lib.new_collection(name);
+            self.lib.add_to_collection(set, &members);
         }
     }
 
@@ -260,6 +390,7 @@ impl App {
                     lib.skipped = skipped;
                     lib.truncated = truncated;
                     self.lib = lib;
+                    self.restore_collections();
                     self.sync_current();
                     touched = true;
                 }
@@ -809,9 +940,14 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attributes = Window::default_attributes()
+        let saved = self.settings.window.sane();
+        let mut attributes = Window::default_attributes()
             .with_title(format!("voxview - {}", self.path().display()))
-            .with_inner_size(LogicalSize::new(1280.0, 800.0));
+            .with_inner_size(LogicalSize::new(saved.width as f64, saved.height as f64))
+            .with_maximized(saved.maximized);
+        if let (Some(x), Some(y)) = (saved.x, saved.y) {
+            attributes = attributes.with_position(LogicalPosition::new(x as f64, y as f64));
+        }
         let window = match event_loop.create_window(attributes) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -976,6 +1112,11 @@ impl ApplicationHandler for App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// The last thing winit calls, on every way out of the loop.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.save_settings();
     }
 }
 
